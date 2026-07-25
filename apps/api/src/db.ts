@@ -11,7 +11,81 @@ const sslRequired = url.searchParams.get("sslmode") === "require";
 const basePool = new Pool({
   connectionString: env.DATABASE_URL,
   ssl: sslRequired ? { rejectUnauthorized: false } : undefined,
+  max: env.PG_POOL_MAX,
+  idleTimeoutMillis: env.PG_IDLE_TIMEOUT_MS,
+  connectionTimeoutMillis: env.PG_CONN_TIMEOUT_MS,
 });
+
+// ── Pool monitoring (#264) ────────────────────────────────────────────────────
+
+export const pgPoolEventsTotal = new client.Counter({
+  name: "pg_pool_events_total",
+  help: "Total count of PostgreSQL pool lifecycle events",
+  labelNames: ["event"],
+});
+
+// Gauges read the pool's own counters on scrape rather than being tracked by
+// hand — `pool.totalCount`/`idleCount`/`waitingCount` are always the source
+// of truth, so there's no risk of manual increment/decrement drift.
+new client.Gauge({
+  name: "pg_pool_active",
+  help: "Number of PostgreSQL pool clients currently checked out (in use)",
+  collect() {
+    this.set(basePool.totalCount - basePool.idleCount);
+  },
+});
+
+new client.Gauge({
+  name: "pg_pool_idle",
+  help: "Number of idle PostgreSQL pool clients available for reuse",
+  collect() {
+    this.set(basePool.idleCount);
+  },
+});
+
+new client.Gauge({
+  name: "pg_pool_waiting",
+  help: "Number of queued requests waiting for a PostgreSQL pool client",
+  collect() {
+    this.set(basePool.waitingCount);
+  },
+});
+
+basePool.on("connect", () => pgPoolEventsTotal.inc({ event: "connect" }));
+basePool.on("acquire", () => pgPoolEventsTotal.inc({ event: "acquire" }));
+basePool.on("remove", () => pgPoolEventsTotal.inc({ event: "remove" }));
+basePool.on("error", (err) => {
+  pgPoolEventsTotal.inc({ event: "error" });
+  logger.error({ err }, "PostgreSQL pool error (idle client)");
+});
+
+// Alert when the pool is under sustained exhaustion pressure: waitingCount > 5
+// for more than 10 consecutive seconds. Checked every second; resets the
+// streak the moment waitingCount drops back to <= 5, and only logs once per
+// breach (not on every tick past 10s) to avoid alert spam.
+const WAITING_ALERT_THRESHOLD = 5;
+const WAITING_ALERT_DURATION_MS = 10_000;
+const POOL_CHECK_INTERVAL_MS = 1_000;
+let waitingBreachSince: number | null = null;
+let waitingAlertFired = false;
+
+setInterval(() => {
+  const waiting = basePool.waitingCount;
+  if (waiting > WAITING_ALERT_THRESHOLD) {
+    if (waitingBreachSince === null) {
+      waitingBreachSince = Date.now();
+    } else if (!waitingAlertFired && Date.now() - waitingBreachSince >= WAITING_ALERT_DURATION_MS) {
+      waitingAlertFired = true;
+      logger.error(
+        { waiting, thresholdSeconds: WAITING_ALERT_DURATION_MS / 1000 },
+        `PostgreSQL pool exhaustion: ${waiting} requests waiting for >${WAITING_ALERT_DURATION_MS / 1000}s`,
+      );
+    }
+  } else {
+    waitingBreachSince = null;
+    waitingAlertFired = false;
+  }
+}, POOL_CHECK_INTERVAL_MS);
 
 // ── Prometheus metrics (#373) ─────────────────────────────────────────────────
 
