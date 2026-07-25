@@ -185,10 +185,6 @@ importersRouter.get("/:id", async (req: Request, res: Response) => {
     return;
   }
   const acct = await contractClient.getAccount(importer.stellar_address);
-  const events = await pool.query(
-    "SELECT id, kind, amount, tx_hash, created_at FROM contract_events WHERE importer_id = $1 ORDER BY created_at DESC LIMIT 50",
-    [importer.id],
-  );
   res.json({
     importer: {
       id: importer.id,
@@ -207,15 +203,87 @@ importersRouter.get("/:id", async (req: Request, res: Response) => {
       yieldAccrued: acct.yieldAccrued.toString(),
       isClawbacked: acct.isClawbacked,
     },
-    events: events.rows.map((e) => ({
-      id: e.id,
-      kind: e.kind,
-      amount: e.amount,
-      txHash: e.tx_hash,
-      txUrl: e.tx_hash ? explorerTx(e.tx_hash) : null,
-      createdAt: e.created_at,
-    })),
   });
+});
+
+// #255: cursor-paginated event log, fetched lazily by the dashboard's
+// infinite-scroll event log section instead of being inlined into
+// GET /importers/:id (which used to embed up to 50 events on every load).
+//
+// Cursor is a base64-encoded "<created_at ISO>|<id>" keyset — row-wise
+// comparison on (created_at, id) keeps pagination stable even when many
+// events share the same created_at timestamp.
+function decodeEventsCursor(raw: string): { createdAt: string; id: string } | null {
+  try {
+    const decoded = Buffer.from(raw, "base64").toString("utf8");
+    const sep = decoded.lastIndexOf("|");
+    if (sep === -1) return null;
+    return { createdAt: decoded.slice(0, sep), id: decoded.slice(sep + 1) };
+  } catch {
+    return null;
+  }
+}
+
+function encodeEventsCursor(createdAt: Date, id: string): string {
+  return Buffer.from(`${createdAt.toISOString()}|${id}`, "utf8").toString("base64");
+}
+
+const EventsQuerySchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().positive().max(100).default(20),
+});
+
+importersRouter.get("/:id/events", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  const parse = EventsQuerySchema.safeParse(req.query);
+  if (!parse.success) {
+    res.status(400).json({ error: "invalid query", details: parse.error.issues });
+    return;
+  }
+  const { limit } = parse.data;
+
+  let cursor: { createdAt: string; id: string } | null = null;
+  if (parse.data.cursor) {
+    cursor = decodeEventsCursor(parse.data.cursor);
+    if (!cursor) {
+      res.status(400).json({ error: "invalid cursor" });
+      return;
+    }
+  }
+
+  const rows = cursor
+    ? await pool.query(
+        `SELECT id, kind, amount, tx_hash, created_at FROM contract_events
+         WHERE importer_id = $1 AND (created_at, id) < ($2::timestamptz, $3::uuid)
+         ORDER BY created_at DESC, id DESC LIMIT $4`,
+        [importer.id, cursor.createdAt, cursor.id, limit],
+      )
+    : await pool.query(
+        `SELECT id, kind, amount, tx_hash, created_at FROM contract_events
+         WHERE importer_id = $1
+         ORDER BY created_at DESC, id DESC LIMIT $2`,
+        [importer.id, limit],
+      );
+
+  const events = rows.rows.map((e) => ({
+    id: e.id,
+    kind: e.kind,
+    amount: e.amount,
+    txHash: e.tx_hash,
+    txUrl: e.tx_hash ? explorerTx(e.tx_hash) : null,
+    createdAt: e.created_at,
+  }));
+
+  const last = rows.rows[rows.rows.length - 1];
+  const nextCursor =
+    rows.rows.length === limit && last ? encodeEventsCursor(last.created_at, last.id) : null;
+
+  res.json({ events, nextCursor });
 });
 
 importersRouter.get("/:id/collateral-status", async (req: Request, res: Response) => {
