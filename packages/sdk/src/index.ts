@@ -35,6 +35,10 @@ export interface CollateralHistoryEntry {
 export interface InvokeResult<T> {
   txHash: string;
   result: T;
+  /** Ledger the transaction was included in — pairs with applicationOrder to uniquely identify the event. */
+  ledgerSequence: number;
+  /** Transaction's position within its ledger. */
+  applicationOrder: number;
 }
 
 export interface TariffShieldClientOptions {
@@ -302,7 +306,7 @@ export class TariffShieldClient {
     }
     const retval = txResult.returnValue;
     const parsed = (retval ? scValToNative(retval) : null) as T;
-    return { txHash, result: parsed };
+    return { txHash, result: parsed, ledgerSequence: txResult.ledger, applicationOrder: txResult.applicationOrder };
   }
 
   private async invokeAndSubmit<T>(
@@ -341,7 +345,7 @@ export class TariffShieldClient {
 
     const retval = txResult.returnValue;
     const parsed = (retval ? scValToNative(retval) : null) as T;
-    return { txHash, result: parsed };
+    return { txHash, result: parsed, ledgerSequence: txResult.ledger, applicationOrder: txResult.applicationOrder };
   }
 }
 

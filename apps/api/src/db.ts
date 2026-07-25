@@ -139,6 +139,13 @@ export async function migrate(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_contract_events_importer ON contract_events(importer_id, created_at DESC);
 
+    ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS ledger_sequence INTEGER;
+    ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_index INTEGER;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_contract_events_ledger_event
+      ON contract_events(ledger_sequence, event_index)
+      WHERE ledger_sequence IS NOT NULL AND event_index IS NOT NULL;
+
     CREATE TABLE IF NOT EXISTS oracle_alerts (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
       importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,

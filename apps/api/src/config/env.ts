@@ -5,6 +5,7 @@ export const Env = z.object({
   PORT: z.coerce.number().int().positive().default(3002).describe("Port for the API server to listen on"),
   NODE_ENV: z.enum(["development", "production", "test"]).default("development").describe("Application environment"),
   DATABASE_URL: z.string().url().describe("PostgreSQL connection string"),
+  REDIS_URL: z.string().default("redis://localhost:6379").describe("Redis connection string for BullMQ job queue"),
   FRONTEND_ORIGIN: z.string().default("http://localhost:3000").describe("Allowed CORS origin for frontend"),
   JWT_SECRET: z.string().min(32).describe("Secret key for signing JSON Web Tokens"),
 
