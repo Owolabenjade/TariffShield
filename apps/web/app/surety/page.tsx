@@ -49,7 +49,11 @@ export default function SuretyDashboard() {
             <ul className="divide-y divide-border rounded-lg border border-border bg-card">
               {importers.map((imp) => (
                 <li key={imp.id}>
-                  <Link href={`/surety/${imp.id}`} className="flex items-center justify-between gap-4 px-4 py-3 hover:bg-background">
+                  <Link
+                    href={`/surety/${imp.id}`}
+                    onMouseEnter={() => api.prefetchImporter(imp.id)}
+                    className="flex items-center justify-between gap-4 px-4 py-3 hover:bg-background"
+                  >
                     <div className="min-w-0 flex-1">
                       <p className="font-medium">{imp.legalName}</p>
                       <p className="text-xs text-muted">Bond <span className="font-mono">{imp.bondId}</span> · {imp.email}</p>

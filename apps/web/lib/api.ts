@@ -70,6 +70,11 @@ async function request<T>(path: string, options: { method?: string; body?: unkno
   return data as T;
 }
 
+// One-shot cache for importer detail prefetches: populated on row hover, consumed
+// by the first getImporter() call after navigation so the detail page can render
+// without waiting on the network. Cleared on read so later refreshes stay fresh.
+const importerPrefetchCache = new Map<string, Promise<ImporterDetail>>();
+
 export const api = {
   signup: (b: { email: string; password: string; role: "importer" | "surety_admin" }) =>
     request<{ token: string; user: import("./auth").AuthUser }>("/auth/signup", { method: "POST", body: b, auth: false }),
@@ -79,7 +84,20 @@ export const api = {
   createImporter: (b: { legalName: string; ein?: string; bondId: number; initialRequiredCollateral: string }) =>
     request<{ importer: Importer }>("/importers", { method: "POST", body: b }),
   listImporters: () => request<{ importers: Importer[] }>("/importers"),
-  getImporter: (id: string) => request<ImporterDetail>(`/importers/${id}`),
+  prefetchImporter: (id: string) => {
+    if (importerPrefetchCache.has(id)) return;
+    const p = request<ImporterDetail>(`/importers/${id}`);
+    importerPrefetchCache.set(id, p);
+    p.catch(() => importerPrefetchCache.delete(id));
+  },
+  getImporter: (id: string) => {
+    const cached = importerPrefetchCache.get(id);
+    if (cached) {
+      importerPrefetchCache.delete(id);
+      return cached;
+    }
+    return request<ImporterDetail>(`/importers/${id}`);
+  },
   uploadTariffCsv: (id: string, b: { filename?: string; annualDutyTotal: number }) =>
     request<{ annualDutyTotal: number; bondFaceValue: number; requiredCollateralStroops: string; txHash: string; txUrl: string }>(
       `/importers/${id}/upload-tariff-csv`, { method: "POST", body: b },

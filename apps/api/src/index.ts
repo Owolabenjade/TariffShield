@@ -3,6 +3,7 @@ import "./instrument.js";
 import * as Sentry from "@sentry/node";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { openApiSpec } from "./docs/openapi.js";
+import compression from "compression";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -219,6 +220,7 @@ app.use(
     crossOriginResourcePolicy: { policy: "cross-origin" },
   }),
 );
+app.use(compression());
 
 const ALLOWED_ORIGINS = (() => {
   const set = new Set<string>(["http://localhost:3000", "http://127.0.0.1:3000"]);
