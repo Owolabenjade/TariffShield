@@ -1,7 +1,16 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { pool, recordAuthenticationAttempt, getFailedAuthAttempts, recordSecurityIncident } from "../db.js";
-import { hashPassword, verifyPassword, signToken, authMiddleware, type AuthedRequest } from "../auth.js";
+import {
+  pool,
+  recordAuthenticationAttempt,
+  getFailedAuthAttempts,
+  recordSecurityIncident,
+  createSession,
+  getActiveSessionCount,
+  revokeOldestSession,
+  revokeSession,
+} from "../db.js";
+import { hashPassword, verifyPassword, signToken, authMiddleware, MAX_SESSIONS, type AuthedRequest } from "../auth.js";
 import { env } from "../config/env.js";
 
 export const authRouter = Router();
@@ -10,6 +19,9 @@ const SignupSchema = z.object({
   email: z.string().email().toLowerCase(),
   password: z.string().min(8),
   role: z.enum(["importer", "surety_admin"]).default("importer"),
+  accept_tos: z.boolean().refine((val) => val === true, {
+    message: "Terms of Service must be accepted",
+  }),
   // #322 — accept the current privacy policy version at signup
   privacyPolicyVersionId: z.string().optional(),
 });
@@ -49,6 +61,16 @@ authRouter.post("/signup", async (req: Request, res: Response) => {
       );
     }
 
+    // Record ToS acceptance at signup (#321)
+    const latestTos = await pool.query("SELECT version_id FROM tos_versions ORDER BY effective_date DESC LIMIT 1");
+    if (latestTos.rowCount) {
+      await pool.query(
+        `INSERT INTO tos_acceptances (user_id, tos_version, accepted_at, ip_address, user_agent, acceptance_method)
+         VALUES ($1, $2, now(), $3, $4, 'signup')`,
+        [u.id, latestTos.rows[0]?.version_id, req.ip ?? null, req.get("user-agent") ?? null],
+      );
+    }
+
     // #324 — surety_admin accounts start with a pending license verification record.
     // Operational routes (clawback, accrue-yield) are blocked until a platform admin
     // marks the record as 'verified' after checking NAIC / state DOI licensing data.
@@ -60,7 +82,8 @@ authRouter.post("/signup", async (req: Request, res: Response) => {
       );
     }
 
-    res.json({ token: signToken({ id: u.id, email: u.email, role: u.role }), user: u });
+    const sessionId = await createSession(u.id, req.ip ?? undefined, req.get("user-agent") ?? undefined);
+    res.json({ token: signToken({ id: u.id, email: u.email, role: u.role, sessionId }), user: u });
   } catch (err) {
     const e = err as { code?: string };
     if (e.code === "23505") {
@@ -117,10 +140,29 @@ authRouter.post("/login", async (req: Request, res: Response) => {
   }
 
   await recordAuthenticationAttempt(email, true, u.id, ipAddress, userAgent);
+
+  // SOC 2 CC6.1: enforce concurrent session limit before issuing a new session.
+  const sessionLimit = MAX_SESSIONS[u.role as keyof typeof MAX_SESSIONS] ?? 5;
+  const activeSessions = await getActiveSessionCount(u.id);
+  if (activeSessions >= sessionLimit) {
+    await revokeOldestSession(u.id);
+  }
+
+  const sessionId = await createSession(u.id, ipAddress, userAgent);
+  const token = signToken({ id: u.id, email: u.email, role: u.role, sessionId });
+
   res.json({
-    token: signToken({ id: u.id, email: u.email, role: u.role }),
+    token,
     user: { id: u.id, email: u.email, role: u.role },
   });
+});
+
+authRouter.post("/logout", authMiddleware, async (req: Request, res: Response) => {
+  const { sessionId } = (req as AuthedRequest).user;
+  if (sessionId) {
+    await revokeSession(sessionId);
+  }
+  res.json({ message: "logged out" });
 });
 
 authRouter.get("/me", authMiddleware, (req: Request, res: Response) => {
@@ -274,7 +316,8 @@ authRouter.post("/saml/:provider/callback", async (req: Request, res: Response) 
     userRole = inserted.rows[0]!.role;
   }
 
-  const token = signToken({ id: userId, email: userEmail, role: userRole });
+  const sessionId = await createSession(userId, req.ip ?? undefined, req.get("user-agent") ?? undefined);
+  const token = signToken({ id: userId, email: userEmail, role: userRole, sessionId });
   const relayState = req.body?.RelayState as string | undefined;
 
   // Redirect browser to frontend with token, or return JSON for API clients

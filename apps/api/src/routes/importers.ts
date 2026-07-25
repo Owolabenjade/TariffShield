@@ -1,24 +1,29 @@
 import { Router, type Request, type Response } from "express";
+import { createHash } from "crypto";
 import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import { pool } from "../db.js";
-import { authMiddleware, privacyReacceptanceGate, type AuthedRequest } from "../auth.js";
+import { pool, getImporterMetrics } from "../db.js";
+import { authMiddleware, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { requireLicenseVerified } from "./surety-license.js";
 import { contractClient, explorerTx, platformKeypair, suretyKeypair } from "../stellar.js";
 import { lookupCbpDutyRate } from "../services/cbp-duty-lookup.js";
+import { validateHtsRates } from "../services/hts-rate-validator.js";
 import { screenImporterEntity, screenWalletAddress } from "../services/aml-screening.js";
 import { validateBondForm301 } from "../services/cbp-bond-validation.js";
 import { env } from "../config/env.js";
+import { enqueueTxSubmit, txSubmitQueue } from "../queue.js";
 
 export const importersRouter = Router();
 importersRouter.use(authMiddleware);
 importersRouter.use(privacyReacceptanceGate);
+importersRouter.use(tosReacceptanceGate);
 
 const CreateImporterSchema = z.object({
   legalName: z.string().min(1),
   ein: z.string().optional(),
   bondId: z.coerce.number().int().positive(),
   initialRequiredCollateral: z.string().regex(/^\d+$/),
+  businessState: z.string().length(2).toUpperCase().optional(),
 });
 
 importersRouter.post("/", async (req: Request, res: Response) => {
@@ -33,7 +38,7 @@ importersRouter.post("/", async (req: Request, res: Response) => {
     res.status(400).json({ error: "invalid input", details: parse.error.issues });
     return;
   }
-  const { legalName, ein, bondId, initialRequiredCollateral } = parse.data;
+  const { legalName, ein, bondId, initialRequiredCollateral, businessState } = parse.data;
 
   const ofacClear = await screenImporterEntity(legalName, ein);
   if (!ofacClear) {
@@ -71,18 +76,18 @@ importersRouter.post("/", async (req: Request, res: Response) => {
   }
 
   const inserted = await pool.query(
-    `INSERT INTO importers (user_id, legal_name, ein, bond_id, stellar_address, stellar_secret_encrypted)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO importers (user_id, legal_name, ein, bond_id, stellar_address, stellar_secret_encrypted, business_state)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING id, legal_name, ein, bond_id, stellar_address, created_at`,
-    [user.id, legalName, ein ?? null, bondId, kp.publicKey(), kp.secret()],
+    [user.id, legalName, ein ?? null, bondId, kp.publicKey(), kp.secret(), businessState ?? "CA"],
   );
   const importer = inserted.rows[0]!;
 
   await pool.query(
     `INSERT INTO bond_records (importer_id, bond_id, bond_type_code, principal_legal_name, principal_ein,
-                               surety_company_name, surety_fein, bond_amount, cbp_minimum_required, effective_date, template_version, cbp_regulation_revision_date)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-    [importer.id, bondId, "02", legalName, ein ?? null, "TBD", "TBD", initialRequiredCollateral, bondValidation.minimumRequired.toString(), new Date(), "1.0", new Date()],
+                               surety_company_name, surety_fein, bond_amount, cbp_minimum_required, effective_date, template_version, cbp_regulation_revision_date, state_code)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+    [importer.id, bondId, "02", legalName, ein ?? null, "TBD", "TBD", initialRequiredCollateral, bondValidation.minimumRequired.toString(), new Date(), "1.0", new Date(), businessState ?? "CA"],
   );
 
   // Fund the importer account via friendbot (testnet only)
@@ -106,8 +111,10 @@ importersRouter.post("/", async (req: Request, res: Response) => {
     importer.id,
   ]);
   await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, tx_hash) VALUES ($1, $2, $3)",
-    [importer.id, "register", onChain.txHash],
+    `INSERT INTO contract_events (importer_id, kind, tx_hash, ledger_sequence, event_index)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (ledger_sequence, event_index) DO NOTHING`,
+    [importer.id, "register", onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder],
   );
 
   res.json({
@@ -142,6 +149,20 @@ importersRouter.get("/", async (req: Request, res: Response) => {
     );
   }
   res.json({ importers: r.rows });
+});
+
+// #251: surety-dashboard aggregate statistics, served from importer_metrics_mv
+// (a materialized view refreshed on a 5-minute schedule — see
+// jobs/refresh-importer-metrics.ts) instead of live GROUP BY queries.
+// Registered before "/:id" so Express doesn't treat "stats" as an :id param.
+importersRouter.get("/stats", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== "surety_admin") {
+    res.status(403).json({ error: "surety admin only" });
+    return;
+  }
+  const metrics = await getImporterMetrics();
+  res.json({ metrics });
 });
 
 async function loadImporterFor(req: Request, importerId: string) {
@@ -240,6 +261,39 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
     return;
   }
 
+  // ── HTS statutory rate validation ──────────────────────────────────────────
+  // Cross-reference every line item's declared duty rate against the USITC HTS
+  // schedule before feeding the rates into the collateral computation.
+  const htsValidation = await validateHtsRates(
+    parse.data.lineItems.map((item) => ({
+      hts_code: item.htsCode,
+      declared_rate: item.dutyRate,
+    })),
+  );
+
+  if (htsValidation.hasBlockingErrors) {
+    res.status(422).json({
+      error: "HTS rate validation failed: one or more line items are underreported",
+      flagged: htsValidation.blocking.map((r) => ({
+        htsCode: r.hts_code,
+        declaredRate: r.declared_rate,
+        statutoryRate: r.statutory_rate,
+        message: r.message,
+      })),
+    });
+    return;
+  }
+
+  // Collect non-blocking warnings to surface in the response.
+  const htsWarnings = htsValidation.warnings.map((r) => ({
+    htsCode: r.hts_code,
+    status: r.status,
+    declaredRate: r.declared_rate,
+    statutoryRate: r.statutory_rate,
+    message: r.message,
+  }));
+
+  // ── Legacy CBP validation (kept for compatibility) ─────────────────────────
   let annualDutyTotal = 0;
   const validationReport = [];
   let hasBlockError = false;
@@ -277,7 +331,7 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
 
   try {
     const onChain = await contractClient.setRequiredCollateral(
-      platformKeypair,
+      [platformKeypair],
       importer.stellar_address,
       requiredStroops,
       env.PRICE_ORACLE_CONTRACT_ID,
@@ -288,8 +342,10 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
       [importer.id, parse.data.filename ?? null, annualDutyTotal, requiredStroops.toString(), onChain.txHash],
     );
     await pool.query(
-      "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'required_changed', $2, $3)",
-      [importer.id, requiredStroops.toString(), onChain.txHash],
+      `INSERT INTO contract_events (importer_id, kind, amount, tx_hash, ledger_sequence, event_index)
+       VALUES ($1, 'required_changed', $2, $3, $4, $5)
+       ON CONFLICT (ledger_sequence, event_index) DO NOTHING`,
+      [importer.id, requiredStroops.toString(), onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder],
     );
 
     res.json({
@@ -298,6 +354,7 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
       requiredCollateralStroops: requiredStroops.toString(),
       txHash: onChain.txHash,
       txUrl: explorerTx(onChain.txHash),
+      htsWarnings: htsWarnings.length > 0 ? htsWarnings : undefined,
     });
   } catch (err: any) {
     const errMsg = String(err);
@@ -349,20 +406,18 @@ importersRouter.post("/:id/deposit", async (req: Request, res: Response) => {
     return;
   }
 
-  const amount = BigInt(parse.data.amountStroops);
-  const importerKp = Keypair.fromSecret(importer.stellar_secret_encrypted);
-
-  const fn =
-    parse.data.bucket === "collateral"
-      ? contractClient.depositCollateral.bind(contractClient)
-      : contractClient.depositReserve.bind(contractClient);
-
-  const onChain = await fn(importerKp, importer.stellar_address, importer.stellar_address, amount);
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, $2, $3, $4)",
-    [importer.id, parse.data.bucket === "collateral" ? "deposit_collateral" : "deposit_reserve", amount.toString(), onChain.txHash],
-  );
-  res.json({ txHash: onChain.txHash, txUrl: explorerTx(onChain.txHash) });
+  const jobId = await enqueueTxSubmit({
+    method: "deposit",
+    importerId: importer.id,
+    keypairSecret: importer.stellar_secret_encrypted,
+    args: {
+      bucket: parse.data.bucket,
+      importerAddress: importer.stellar_address,
+      sourceAddress: importer.stellar_address,
+      amountStroops: parse.data.amountStroops,
+    },
+  });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 importersRouter.post("/:id/auto-top-up", async (req: Request, res: Response) => {
@@ -371,16 +426,15 @@ importersRouter.post("/:id/auto-top-up", async (req: Request, res: Response) => 
     res.status(404).json({ error: "not found" });
     return;
   }
-  const onChain = await contractClient.autoTopUp(platformKeypair, importer.stellar_address);
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'auto_top_up', $2, $3)",
-    [importer.id, onChain.result.toString(), onChain.txHash],
-  );
-  res.json({
-    movedStroops: onChain.result.toString(),
-    txHash: onChain.txHash,
-    txUrl: explorerTx(onChain.txHash),
+  const jobId = await enqueueTxSubmit({
+    method: "auto_top_up",
+    importerId: importer.id,
+    platformKey: true,
+    args: {
+      importerAddress: importer.stellar_address,
+    },
   });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 const WithdrawSchema = z.object({
@@ -405,18 +459,17 @@ importersRouter.post("/:id/withdraw", async (req: Request, res: Response) => {
     return;
   }
 
-  const importerKp = Keypair.fromSecret(importer.stellar_secret_encrypted);
-  const onChain = await contractClient.withdrawCollateral(
-    importerKp,
-    importer.stellar_address,
-    importer.stellar_address,
-    BigInt(parse.data.amountStroops),
-  );
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'withdraw', $2, $3)",
-    [importer.id, parse.data.amountStroops, onChain.txHash],
-  );
-  res.json({ txHash: onChain.txHash, txUrl: explorerTx(onChain.txHash) });
+  const jobId = await enqueueTxSubmit({
+    method: "withdraw",
+    importerId: importer.id,
+    keypairSecret: importer.stellar_secret_encrypted,
+    args: {
+      importerAddress: importer.stellar_address,
+      sourceAddress: importer.stellar_address,
+      amountStroops: parse.data.amountStroops,
+    },
+  });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 // --- Surety admin actions ---
@@ -439,16 +492,16 @@ importersRouter.post("/:id/accrue-yield", requireLicenseVerified, async (req: Re
     res.status(400).json({ error: "invalid input" });
     return;
   }
-  const onChain = await contractClient.accrueYield(
-    platformKeypair,
-    importer.stellar_address,
-    BigInt(parse.data.amountStroops),
-  );
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'yield', $2, $3)",
-    [importer.id, parse.data.amountStroops, onChain.txHash],
-  );
-  res.json({ txHash: onChain.txHash, txUrl: explorerTx(onChain.txHash) });
+  const jobId = await enqueueTxSubmit({
+    method: "accrue_yield",
+    importerId: importer.id,
+    platformKey: true,
+    args: {
+      importerAddress: importer.stellar_address,
+      amountStroops: parse.data.amountStroops,
+    },
+  });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 importersRouter.post("/:id/clawback", requireLicenseVerified, async (req: Request, res: Response) => {
@@ -462,14 +515,127 @@ importersRouter.post("/:id/clawback", requireLicenseVerified, async (req: Reques
     res.status(404).json({ error: "not found" });
     return;
   }
-  const onChain = await contractClient.clawback(suretyKeypair, importer.stellar_address);
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'clawback', $2, $3)",
-    [importer.id, onChain.result.toString(), onChain.txHash],
-  );
-  res.json({
-    clawedStroops: onChain.result.toString(),
-    txHash: onChain.txHash,
-    txUrl: explorerTx(onChain.txHash),
+  const jobId = await enqueueTxSubmit({
+    method: "clawback",
+    importerId: importer.id,
+    suretyKey: true,
+    args: {
+      importerAddress: importer.stellar_address,
+    },
   });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
+});
+
+// ── Issue #335: Oracle data reconciliation endpoint ───────────────────────────
+
+const VerifyOracleSchema = z.object({
+  as_of_date: z.string().datetime().optional(),
+});
+
+importersRouter.post("/:id/verify-oracle-data", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importerId = String(req.params.id ?? "");
+
+  // Accessible by: the importer themselves, surety_admin, or platform admin (surety_admin covers both)
+  let importer: Record<string, unknown> | null = null;
+  if (user.role === "surety_admin") {
+    const r = await pool.query("SELECT * FROM importers WHERE id = $1", [importerId]);
+    importer = r.rows[0] ?? null;
+  } else {
+    const r = await pool.query("SELECT * FROM importers WHERE id = $1 AND user_id = $2", [importerId, user.id]);
+    importer = r.rows[0] ?? null;
+  }
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  const parse = VerifyOracleSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: "invalid input", details: parse.error.issues });
+    return;
+  }
+
+  // Fetch latest tariff upload for this importer
+  const uploadQ = parse.data.as_of_date
+    ? await pool.query(
+        "SELECT * FROM tariff_uploads WHERE importer_id = $1 AND created_at <= $2 ORDER BY created_at DESC LIMIT 1",
+        [importerId, parse.data.as_of_date],
+      )
+    : await pool.query(
+        "SELECT * FROM tariff_uploads WHERE importer_id = $1 ORDER BY created_at DESC LIMIT 1",
+        [importerId],
+      );
+
+  if (!uploadQ.rowCount || uploadQ.rowCount === 0) {
+    res.status(404).json({ error: "no tariff CSV data found for this importer" });
+    return;
+  }
+  const upload = uploadQ.rows[0]!;
+
+  // Re-derive: required = annual_duty * 10% * 50%
+  const annualDuty = Number(upload.annual_duty_total);
+  const computed = BigInt(Math.round(annualDuty * 0.1 * 0.5 * 1e7));
+
+  // CSV hash — hash the stored annual_duty_total + filename as a stable fingerprint
+  const csvFingerprint = `${upload.filename ?? ""}:${upload.annual_duty_total}`;
+  const csvHash = createHash("sha256").update(csvFingerprint).digest("hex");
+
+  // Fetch on-chain value
+  const onChainStr = await getRequiredCollateralOnChain(importer.stellar_address as string);
+  const onChain = BigInt(onChainStr);
+
+  const computedNum = Number(computed);
+  const onChainNum = Number(onChain);
+  const deviationPct = onChainNum === 0
+    ? (computedNum === 0 ? 0 : 100)
+    : Math.abs(computedNum - onChainNum) / onChainNum * 100;
+
+  const match = deviationPct <= 1.0;
+
+  // Write reconciliation_failure alert if material mismatch
+  if (!match && deviationPct > 1.0) {
+    await pool.query(
+      `INSERT INTO oracle_alerts (importer_id, old_value, new_value, pct_change, tx_hash)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT DO NOTHING`,
+      [importerId, onChainStr, computed.toString(), deviationPct.toFixed(2), "reconciliation_failure"],
+    );
+  }
+
+  res.json({
+    computed: computed.toString(),
+    on_chain: onChainStr,
+    match,
+    deviation_pct: Math.round(deviationPct * 100) / 100,
+    csv_hash: csvHash,
+    collateral_timestamp: (upload.created_at as Date).toISOString(),
+  });
+});
+
+importersRouter.get("/:id/tx-status/:jobId", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  const job = await txSubmitQueue.getJob(String(req.params.jobId ?? ""));
+  if (!job) {
+    res.status(404).json({ error: "job not found" });
+    return;
+  }
+
+  const state = await job.getState();
+  const progress = job.progress;
+  const result = job.returnvalue;
+  const failedReason = job.failedReason;
+
+  if (state === "completed") {
+    res.json({ state, result });
+  } else if (state === "failed") {
+    res.status(400).json({ state, error: failedReason });
+  } else {
+    res.json({ state, progress });
+  }
 });

@@ -5,6 +5,7 @@ export const Env = z.object({
   PORT: z.coerce.number().int().positive().default(3002).describe("Port for the API server to listen on"),
   NODE_ENV: z.enum(["development", "production", "test"]).default("development").describe("Application environment"),
   DATABASE_URL: z.string().url().describe("PostgreSQL connection string"),
+  REDIS_URL: z.string().default("redis://localhost:6379").describe("Redis connection string for BullMQ job queue"),
   FRONTEND_ORIGIN: z.string().default("http://localhost:3000").describe("Allowed CORS origin for frontend"),
   JWT_SECRET: z.string().min(32).describe("Secret key for signing JSON Web Tokens"),
 
@@ -22,6 +23,10 @@ export const Env = z.object({
   CBP_VALIDATION_MODE: z.enum(["warn", "block"]).default("block").describe("CBP lookup failure mode"),
   ORACLE_ALERT_THRESHOLD_PCT: z.coerce.number().default(50).describe("Alert threshold for collateral change"),
   ALERT_CHANNEL: z.string().default("console").describe("Alert channel for oracle monitor"),
+
+  // #332 / #334 — price oracle and emergency admin secrets
+  PRICE_ORACLE_CONTRACT_ID: z.string().startsWith("C").min(56).optional().describe("Soroban contract ID for the USDC/USD price oracle"),
+  EMERGENCY_ADMIN_SECRET: z.string().startsWith("S").min(56).optional().describe("Emergency oracle admin Stellar secret key"),
 
   // #339 — separate oracle role keypair
   ORACLE_STELLAR_SECRET: z.string().startsWith("S").min(56).optional().describe("Oracle-role Stellar secret key (separate from PLATFORM_STELLAR_SECRET)"),

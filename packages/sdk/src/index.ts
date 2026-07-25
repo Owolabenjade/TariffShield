@@ -35,6 +35,10 @@ export interface CollateralHistoryEntry {
 export interface InvokeResult<T> {
   txHash: string;
   result: T;
+  /** Ledger the transaction was included in — pairs with applicationOrder to uniquely identify the event. */
+  ledgerSequence: number;
+  /** Transaction's position within its ledger. */
+  applicationOrder: number;
 }
 
 export interface TariffShieldClientOptions {
@@ -119,13 +123,15 @@ export class TariffShieldClient {
   }
 
   async setRequiredCollateral(
-    signer: Keypair,
+    signers: Keypair[],
     importer: string,
     newRequired: bigint,
     priceOracleContract?: string,
     bypassRateLimit?: boolean,
+    emergency?: boolean,
   ): Promise<InvokeResult<null>> {
     const args = [
+      addressToScVal(signer.publicKey()),
       addressToScVal(importer),
       nativeToScVal(newRequired, { type: "i128" }),
     ];
@@ -137,6 +143,7 @@ export class TariffShieldClient {
     }
 
     args.push(nativeToScVal(bypassRateLimit ?? false, { type: "bool" }));
+    args.push(nativeToScVal(emergency ?? false, { type: "bool" }));
 
     return this.invokeAndSubmit(signer, "set_required_collateral", args);
   }
@@ -167,6 +174,15 @@ export class TariffShieldClient {
 
   async clawback(signer: Keypair, importer: string): Promise<InvokeResult<bigint>> {
     return this.invokeAndSubmit(signer, "clawback", [addressToScVal(importer)]);
+  }
+
+  /**
+   * Transfer the platform admin role to a new address.
+   * The current admin (signer) authorizes the handoff on-chain; the new admin
+   * becomes effective immediately and an `admin_transferred` event is emitted.
+   */
+  async transferAdmin(signer: Keypair, newAdmin: string): Promise<InvokeResult<null>> {
+    return this.invokeAndSubmit(signer, "transfer_admin", [addressToScVal(newAdmin)]);
   }
 
   // #336 — importer formally disputes the most recent oracle-set required_collateral.
@@ -254,6 +270,45 @@ export class TariffShieldClient {
     return sim.result.retval;
   }
 
+  private async invokeAndSubmitMulti<T>(
+    signers: Keypair[],
+    method: string,
+    args: xdr.ScVal[],
+    primary: Keypair,
+  ): Promise<InvokeResult<T>> {
+    const account = await this.server.getAccount(primary.publicKey());
+    const tx = new TransactionBuilder(account, {
+      fee: DEFAULT_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(this.contract.call(method, ...args))
+      .setTimeout(this.txTimeoutSeconds)
+      .build();
+
+    const prepared = await this.server.prepareTransaction(tx);
+    for (const signer of signers) {
+      prepared.sign(signer);
+    }
+    const sendResponse = await this.server.sendTransaction(prepared);
+    if (sendResponse.status === "ERROR") {
+      throw new Error(`send failed: ${JSON.stringify(sendResponse.errorResult)}`);
+    }
+    const txHash = sendResponse.hash;
+
+    let txResult = await this.server.getTransaction(txHash);
+    const deadline = Date.now() + 60_000;
+    while (txResult.status === "NOT_FOUND" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500));
+      txResult = await this.server.getTransaction(txHash);
+    }
+    if (txResult.status !== "SUCCESS") {
+      throw new Error(`tx ${txHash} status=${txResult.status}`);
+    }
+    const retval = txResult.returnValue;
+    const parsed = (retval ? scValToNative(retval) : null) as T;
+    return { txHash, result: parsed, ledgerSequence: txResult.ledger, applicationOrder: txResult.applicationOrder };
+  }
+
   private async invokeAndSubmit<T>(
     signer: Keypair,
     method: string,
@@ -290,7 +345,7 @@ export class TariffShieldClient {
 
     const retval = txResult.returnValue;
     const parsed = (retval ? scValToNative(retval) : null) as T;
-    return { txHash, result: parsed };
+    return { txHash, result: parsed, ledgerSequence: txResult.ledger, applicationOrder: txResult.applicationOrder };
   }
 }
 

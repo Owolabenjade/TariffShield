@@ -4,12 +4,13 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Nav } from "@/components/Nav";
-import { api, ApiError, type Importer, stroopsToXlm } from "@/lib/api";
+import { api, ApiError, type Importer, type ImporterMetrics, stroopsToXlm } from "@/lib/api";
 import { getUser, isAuthenticated } from "@/lib/auth";
 
 export default function SuretyDashboard() {
   const router = useRouter();
   const [importers, setImporters] = useState<Importer[] | null>(null);
+  const [metrics, setMetrics] = useState<ImporterMetrics | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -26,6 +27,14 @@ export default function SuretyDashboard() {
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     }
+    // #251: served from importer_metrics_mv — failures here shouldn't block
+    // the (more important) importer list from rendering.
+    try {
+      const s = await api.getStats();
+      setMetrics(s.metrics);
+    } catch (e) {
+      console.error("failed to load dashboard stats", e);
+    }
   }
 
   return (
@@ -34,6 +43,15 @@ export default function SuretyDashboard() {
       <main className="max-w-5xl mx-auto px-6 py-10">
         <h1 className="text-2xl font-semibold tracking-tight">Surety portfolio</h1>
         <p className="mt-1 text-sm text-muted">Bonded importers + emergency clawback. All actions execute on Stellar testnet.</p>
+
+        {metrics ? (
+          <div className="mt-6 grid gap-4 sm:grid-cols-4">
+            <MetricTile label="Total importers" value={String(metrics.totalImporters)} />
+            <MetricTile label="Total bond value" value={`${stroopsToXlm(metrics.totalBondValue)} XLM`} />
+            <MetricTile label="Avg. balance" value={`${stroopsToXlm(metrics.avgBalance)} XLM`} />
+            <MetricTile label="Compliance rate" value={`${metrics.complianceRate}%`} />
+          </div>
+        ) : null}
 
         {error ? <p className="mt-4 rounded border border-danger bg-danger/10 px-3 py-2 text-sm text-danger">{error}</p> : null}
 
@@ -49,7 +67,11 @@ export default function SuretyDashboard() {
             <ul className="divide-y divide-border rounded-lg border border-border bg-card">
               {importers.map((imp) => (
                 <li key={imp.id}>
-                  <Link href={`/surety/${imp.id}`} className="flex items-center justify-between gap-4 px-4 py-3 hover:bg-background">
+                  <Link
+                    href={`/surety/${imp.id}`}
+                    onMouseEnter={() => api.prefetchImporter(imp.id)}
+                    className="flex items-center justify-between gap-4 px-4 py-3 hover:bg-background"
+                  >
                     <div className="min-w-0 flex-1">
                       <p className="font-medium">{imp.legalName}</p>
                       <p className="text-xs text-muted">Bond <span className="font-mono">{imp.bondId}</span> · {imp.email}</p>
@@ -64,5 +86,14 @@ export default function SuretyDashboard() {
         </div>
       </main>
     </>
+  );
+}
+
+function MetricTile({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <p className="text-xs uppercase tracking-wide text-muted">{label}</p>
+      <p className="mt-1 text-xl font-semibold">{value}</p>
+    </div>
   );
 }

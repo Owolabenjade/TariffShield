@@ -139,6 +139,13 @@ export async function migrate(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_contract_events_importer ON contract_events(importer_id, created_at DESC);
 
+    ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS ledger_sequence INTEGER;
+    ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_index INTEGER;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_contract_events_ledger_event
+      ON contract_events(ledger_sequence, event_index)
+      WHERE ledger_sequence IS NOT NULL AND event_index IS NOT NULL;
+
     CREATE TABLE IF NOT EXISTS oracle_alerts (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
       importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
@@ -180,6 +187,20 @@ export async function migrate(): Promise<void> {
     );
 
     CREATE INDEX IF NOT EXISTS idx_security_incidents_severity ON security_incidents(severity, detected_at DESC);
+
+    -- #325: Automated DAST and security findings
+    CREATE TABLE IF NOT EXISTS security_findings (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      severity TEXT NOT NULL CHECK (severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')),
+      affected_endpoint TEXT,
+      discovery_date TIMESTAMPTZ NOT NULL DEFAULT now(),
+      remediation_sla TIMESTAMPTZ NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved', 'accepted_risk')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_security_findings_status_severity ON security_findings(status, severity);
 
     CREATE TABLE IF NOT EXISTS data_erasure_requests (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -242,6 +263,33 @@ export async function migrate(): Promise<void> {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_saml_subject ON users(saml_subject_id, idp_entity_id)
       WHERE saml_subject_id IS NOT NULL;
 
+    -- #321: Terms of Service versioning and tracking
+    CREATE TABLE IF NOT EXISTS tos_versions (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      version_id TEXT UNIQUE NOT NULL,
+      effective_date DATE NOT NULL,
+      change_summary TEXT NOT NULL,
+      requires_reacceptance BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS tos_acceptances (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+      tos_version TEXT NOT NULL REFERENCES tos_versions(version_id),
+      accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      ip_address TEXT,
+      user_agent TEXT,
+      acceptance_method TEXT NOT NULL CHECK (acceptance_method IN ('signup', 're-acceptance'))
+    );
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS tos_reacceptance_required BOOLEAN NOT NULL DEFAULT FALSE;
+
+    -- Insert an initial ToS version if it doesn't exist
+    INSERT INTO tos_versions (version_id, effective_date, change_summary)
+      VALUES ('v1.0.0', CURRENT_DATE, 'Initial Terms of Service')
+      ON CONFLICT (version_id) DO NOTHING;
+
     -- #322: privacy policy versioning
     CREATE TABLE IF NOT EXISTS privacy_policy_versions (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -283,7 +331,9 @@ export async function migrate(): Promise<void> {
       signed_document_hash TEXT,
       completed_at TIMESTAMPTZ,
       pdf_s3_key TEXT,
-      last_reminder_sent_at TIMESTAMPTZ,
+      last_reminder_sent_at TIMESTAMPTZ
+    );
+
     -- #312: KYC document storage with retention schedule
     CREATE TABLE IF NOT EXISTS kyc_documents (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -401,11 +451,169 @@ export async function migrate(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_collateral_disputes_importer
       ON collateral_disputes(importer_id, raised_at DESC);
+
+    -- Oracle price feed: durable audit trail of every set_required_collateral event.
+    CREATE TABLE IF NOT EXISTS oracle_price_feed (
+      id                   UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
+      importer_id          UUID          REFERENCES importers(id) ON DELETE SET NULL,
+      importer_address     TEXT          NOT NULL,
+      required_collateral  NUMERIC(20,7) NOT NULL,
+      previous_collateral  NUMERIC(20,7) NOT NULL DEFAULT 0,
+      pct_change           NUMERIC(7,4)  NOT NULL DEFAULT 0,
+      tx_hash              VARCHAR(64)   NOT NULL,
+      ledger_sequence      INTEGER       NOT NULL,
+      set_by               VARCHAR(64)   NOT NULL DEFAULT '',
+      emergency_override   BOOLEAN       NOT NULL DEFAULT FALSE,
+      created_at           TIMESTAMPTZ   NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_oracle_price_feed_importer
+      ON oracle_price_feed(importer_id, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_oracle_price_feed_ledger
+      ON oracle_price_feed(ledger_sequence);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_oracle_price_feed_tx_importer
+      ON oracle_price_feed(tx_hash, importer_address);
+
+    -- Checkpoint for the oracle event listener (resume after downtime).
+    CREATE TABLE IF NOT EXISTS listener_state (
+      id                   TEXT         PRIMARY KEY,
+      last_ledger_sequence INTEGER      NOT NULL,
+      updated_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
+    );
+
+    -- #306 SOC 2 CC6: server-side session table for 15-min inactivity timeout and
+    -- concurrent session limits. Sessions are created on login and revoked on logout.
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      last_activity TIMESTAMPTZ NOT NULL DEFAULT now(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      revoked_at TIMESTAMPTZ,
+      ip_address TEXT,
+      user_agent TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id
+      ON user_sessions(user_id) WHERE revoked_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS surety_state_licenses (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      surety_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      state_code TEXT NOT NULL,
+      license_number TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (surety_id, state_code)
+    );
+
+    CREATE TABLE IF NOT EXISTS regulatory_report_audit_logs (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      surety_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      state_code TEXT NOT NULL,
+      start_date DATE NOT NULL,
+      end_date DATE NOT NULL,
+      output_format TEXT NOT NULL,
+      generated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_surety_state_licenses_surety ON surety_state_licenses(surety_id, state_code);
+    CREATE INDEX IF NOT EXISTS idx_regulatory_report_audit_logs_surety ON regulatory_report_audit_logs(surety_id, generated_at DESC);
+
+    ALTER TABLE bond_records ADD COLUMN IF NOT EXISTS state_code TEXT NOT NULL DEFAULT 'CA';
+    ALTER TABLE importers ADD COLUMN IF NOT EXISTS business_state TEXT NOT NULL DEFAULT 'CA';
+
+    -- #251: surety-dashboard aggregate statistics, pre-computed instead of a
+    -- live GROUP BY over importers/bond_records/contract_events on every
+    -- page load. See apps/api/migrations/002_importer_metrics_mv.sql for the
+    -- full metric-definition rationale.
+    CREATE MATERIALIZED VIEW IF NOT EXISTS importer_metrics_mv AS
+    SELECT
+      1 AS singleton_id,
+      (SELECT COUNT(*) FROM importers) AS total_importers,
+      (SELECT COALESCE(SUM(bond_amount), 0) FROM bond_records) AS total_bond_value,
+      (SELECT ROUND(COALESCE(AVG(collateral_balance), 0)) FROM importers) AS avg_balance,
+      (
+        SELECT CASE WHEN COUNT(*) = 0 THEN 100.0
+          ELSE ROUND(100.0 * COUNT(*) FILTER (WHERE bond_amount >= cbp_minimum_required) / COUNT(*), 2)
+        END
+        FROM bond_records
+      ) AS compliance_rate,
+      (
+        SELECT COUNT(*) FROM contract_events
+        WHERE kind IN ('deposit_collateral', 'deposit_reserve', 'auto_top_up')
+          AND created_at >= now() - INTERVAL '30 days'
+      ) AS topup_count_30d,
+      now() AS refreshed_at;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_mv_singleton
+      ON importer_metrics_mv (singleton_id);
   `,
     undefined,
     "migrate_schema",
   );
   console.log("[migrate] schema ready");
+}
+
+// ── importer_metrics_mv (#251) ────────────────────────────────────────────────
+
+export interface ImporterMetrics {
+  totalImporters: number;
+  totalBondValue: string;
+  avgBalance: string;
+  complianceRate: number;
+  topupCount30d: number;
+  refreshedAt: string;
+}
+
+/**
+ * Read the pre-computed dashboard statistics from importer_metrics_mv.
+ * Backed by a unique index on the (single-row) view, so this is a fast
+ * indexed lookup rather than a live aggregate — target < 5ms p95.
+ */
+export async function getImporterMetrics(): Promise<ImporterMetrics> {
+  const result = await timedQuery<{
+    total_importers: number;
+    total_bond_value: string;
+    avg_balance: string;
+    compliance_rate: string;
+    topup_count_30d: number;
+    refreshed_at: Date;
+  }>("SELECT * FROM importer_metrics_mv WHERE singleton_id = 1", undefined, "select_importer_metrics_mv");
+
+  const row = result.rows[0];
+  if (!row) {
+    return {
+      totalImporters: 0,
+      totalBondValue: "0",
+      avgBalance: "0",
+      complianceRate: 100,
+      topupCount30d: 0,
+      refreshedAt: new Date(0).toISOString(),
+    };
+  }
+
+  return {
+    totalImporters: row.total_importers,
+    totalBondValue: row.total_bond_value,
+    avgBalance: row.avg_balance,
+    complianceRate: Number(row.compliance_rate),
+    topupCount30d: row.topup_count_30d,
+    refreshedAt: row.refreshed_at.toISOString(),
+  };
+}
+
+/**
+ * Refresh importer_metrics_mv without blocking concurrent reads.
+ * Requires the unique index created alongside the view (see migrate()).
+ */
+export async function refreshImporterMetrics(): Promise<void> {
+  await timedQuery(
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY importer_metrics_mv",
+    undefined,
+    "refresh_importer_metrics_mv",
+  );
 }
 
 export async function getLastProcessedLedger(): Promise<number | null> {
@@ -442,12 +650,13 @@ export async function ping(): Promise<void> {
 /**
  * Returns all bonds that have been registered on-chain.
  */
-export async function getActiveBonds(): Promise<{ bondId: string; dbBalance: string }[]> {
-  const result = await pool.query(
-    "SELECT bond_id, collateral_balance FROM importers WHERE registered_on_chain_tx IS NOT NULL"
+export async function getActiveBonds(): Promise<{ bondId: string; stellarAddress: string; dbBalance: string }[]> {
+  const result = await pool.query<{ bond_id: string; stellar_address: string; collateral_balance: string }>(
+    "SELECT bond_id, stellar_address, collateral_balance FROM importers WHERE registered_on_chain_tx IS NOT NULL"
   );
   return result.rows.map((row) => ({
     bondId: row.bond_id,
+    stellarAddress: row.stellar_address,
     dbBalance: row.collateral_balance,
   }));
 }
@@ -516,4 +725,94 @@ export async function createDataErasureRequest(
     "insert_erasure_request",
   );
   return result.rows[0]?.id ?? "";
+}
+
+// ── SOC 2 CC6 — Session management (#306) ────────────────────────────────────
+
+const SESSION_INACTIVITY_MINUTES = 15;
+
+export async function createSession(
+  userId: string,
+  ipAddress?: string,
+  userAgent?: string,
+): Promise<string> {
+  const result = await timedQuery<{ id: string }>(
+    `INSERT INTO user_sessions (user_id, ip_address, user_agent)
+     VALUES ($1, $2, $3) RETURNING id`,
+    [userId, ipAddress ?? null, userAgent ?? null],
+    "insert_user_session",
+  );
+  return result.rows[0]!.id;
+}
+
+export async function validateSession(sessionId: string): Promise<boolean> {
+  const result = await timedQuery<{ id: string }>(
+    `SELECT id FROM user_sessions
+     WHERE id = $1
+       AND revoked_at IS NULL
+       AND last_activity > now() - INTERVAL '${SESSION_INACTIVITY_MINUTES} minutes'`,
+    [sessionId],
+    "validate_user_session",
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+export function touchSession(sessionId: string): void {
+  timedQuery(
+    "UPDATE user_sessions SET last_activity = now() WHERE id = $1 AND revoked_at IS NULL",
+    [sessionId],
+    "touch_user_session",
+  ).catch(() => {});
+}
+
+export async function revokeSession(sessionId: string): Promise<void> {
+  await timedQuery(
+    "UPDATE user_sessions SET revoked_at = now() WHERE id = $1",
+    [sessionId],
+    "revoke_user_session",
+  );
+}
+
+export async function getActiveSessionCount(userId: string): Promise<number> {
+  const result = await timedQuery<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM user_sessions
+     WHERE user_id = $1 AND revoked_at IS NULL
+       AND last_activity > now() - INTERVAL '${SESSION_INACTIVITY_MINUTES} minutes'`,
+    [userId],
+    "count_active_sessions",
+  );
+  return parseInt(result.rows[0]?.count ?? "0", 10);
+}
+
+export async function revokeOldestSession(userId: string): Promise<void> {
+  await timedQuery(
+    `UPDATE user_sessions SET revoked_at = now()
+     WHERE id = (
+       SELECT id FROM user_sessions
+       WHERE user_id = $1 AND revoked_at IS NULL
+       ORDER BY last_activity ASC
+       LIMIT 1
+     )`,
+    [userId],
+    "revoke_oldest_session",
+  );
+}
+
+export async function getStaleAccounts(
+  days: number,
+): Promise<Array<{ id: string; email: string; last_login: string | null }>> {
+  const result = await timedQuery<{ id: string; email: string; last_login: string | null }>(
+    `SELECT u.id, u.email,
+            MAX(a.attempted_at) AS last_login
+       FROM users u
+       LEFT JOIN authentication_attempts a
+         ON a.user_id = u.id AND a.success = TRUE
+      GROUP BY u.id, u.email
+     HAVING MAX(a.attempted_at) IS NULL
+         OR MAX(a.attempted_at) < now() - ($1::integer * INTERVAL '1 day')
+      ORDER BY last_login ASC NULLS FIRST`,
+    [days],
+    "select_stale_accounts",
+  );
+  return result.rows;
 }

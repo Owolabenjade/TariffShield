@@ -19,3 +19,10 @@ deployments.json
 .vscode
 .idea
 Cargo.lock
+
+# Test snapshots
+__snapshots__/
+*.snap
+
+# k6 benchmark results (#265)
+apps/api/tests/load/results/

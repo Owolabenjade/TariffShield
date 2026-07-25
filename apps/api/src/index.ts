@@ -2,6 +2,8 @@ import "./tracing.js";
 import "./instrument.js";
 import * as Sentry from "@sentry/node";
 import express, { type NextFunction, type Request, type Response } from "express";
+import { openApiSpec } from "./docs/openapi.js";
+import compression from "compression";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -12,17 +14,22 @@ import { authRouter } from "./routes/auth.js";
 import { importersRouter } from "./routes/importers.js";
 import { adminRouter } from "./routes/admin.js";
 import { privacyRouter } from "./routes/privacy.js";
+import { tosRouter } from "./routes/tos.js";
 import { bondSignaturesRouter, bondWebhookRouter } from "./routes/bond-signatures.js";
 import { startIndexer } from "./indexer.js";
 import { ping } from "./db.js";
 import { pingRpc } from "./stellar.js";
 import { startReconciliationJob } from "./jobs/reconcile-balances.js";
 import { startOracleMonitor } from "./services/oracle-monitor.js";
+import { startOracleEventListener } from "./services/oracle-event-listener.js";
 import { privacyReacceptanceGate } from "./auth.js";
 import { complianceRouter } from "./routes/compliance.js";
 import { kycRouter } from "./routes/kyc.js";
 import { startComplianceReportScheduler } from "./jobs/compliance-report.js";
+import { startImporterMetricsScheduler } from "./jobs/refresh-importer-metrics.js";
 import { suretyLicenseRouter } from "./routes/surety-license.js";
+import { regulatoryRouter } from "./routes/regulatory.js";
+import { healthRouter } from "./routes/health.js";
 
 const app = express();
 
@@ -214,6 +221,7 @@ app.use(
     crossOriginResourcePolicy: { policy: "cross-origin" },
   }),
 );
+app.use(compression());
 
 const ALLOWED_ORIGINS = (() => {
   const set = new Set<string>(["http://localhost:3000", "http://127.0.0.1:3000"]);
@@ -244,61 +252,7 @@ const authLimiter = rateLimit({
   message: { error: "too many auth attempts; try again in 15 minutes" },
 });
 
-app.get("/health", async (_req, res) => {
-  const checks = {
-    db: "ok",
-    soroban: "ok",
-  };
-  let hasError = false;
-
-  try {
-    await ping();
-  } catch (err) {
-    checks.db = "failed";
-    hasError = true;
-  }
-
-  try {
-    await pingRpc();
-  } catch (err) {
-    checks.soroban = "failed";
-    hasError = true;
-  }
-
-  if (hasError) {
-    res.status(503).json({
-      status: "degraded",
-      ...checks,
-    });
-  } else {
-    res.json({
-      status: "ok",
-      ...checks,
-      contractId: env.TARIFF_SHIELD_CONTRACT_ID,
-      network: env.STELLAR_NETWORK,
-      env: isProduction ? "production" : "development",
-    });
-  }
-});
-
-/**
- * Liveness probe: returns 200 OK unconditionally as long as the process is running.
- */
-app.get("/health/live", (_req, res) => {
-  res.status(200).send("OK");
-});
-
-/**
- * Readiness probe: checks all dependencies before clearing the service for traffic.
- */
-app.get("/health/ready", async (_req, res) => {
-  try {
-    await Promise.all([ping(), pingRpc()]);
-    res.status(200).send("OK");
-  } catch (err) {
-    res.status(503).send("Service Unavailable");
-  }
-});
+app.use("/health", healthRouter);
 
 client.collectDefaultMetrics();
 
@@ -311,6 +265,42 @@ app.get("/metrics", metricsIpGuard, async (_req, res) => {
   }
 });
 
+// ── OpenAPI spec + Swagger UI (issue #286) ────────────────────────────────
+
+app.get("/docs/openapi.json", (_req, res) => {
+  res.json(openApiSpec);
+});
+
+app.get("/docs", (_req, res) => {
+  const specUrl = "/docs/openapi.json";
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>TariffShield API Docs</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({
+      url: "${specUrl}",
+      dom_id: "#swagger-ui",
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+      layout: "BaseLayout",
+      deepLinking: true,
+      tryItOutEnabled: true,
+    });
+  </script>
+</body>
+</html>`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.use("/auth/signup", authLimiter);
 app.use("/auth/login", authLimiter);
 app.use("/auth", authRouter);
@@ -319,8 +309,10 @@ app.use("/importers", kycRouter);
 app.use("/compliance", complianceRouter);
 app.use("/admin", adminRouter);
 app.use("/account", privacyRouter);
+app.use("/account", tosRouter);
 app.use("/privacy", privacyRouter);
 app.use("/surety-license", suretyLicenseRouter);
+app.use("/api/v1/regulatory", regulatoryRouter);
 app.use("/bonds", bondWebhookRouter);   // unauthenticated DocuSign webhook
 app.use("/api", bondSignaturesRouter);  // authenticated bond signature routes
 
@@ -336,7 +328,9 @@ async function start() {
   await startIndexer();
   startReconciliationJob();
   await startOracleMonitor();
+  await startOracleEventListener();
   startComplianceReportScheduler();
+  startImporterMetricsScheduler();
   app.listen(env.PORT, () => {
     console.log(`[boot] tariffshield API on :${env.PORT}`);
     console.log(`[boot] contract: ${env.TARIFF_SHIELD_CONTRACT_ID}`);

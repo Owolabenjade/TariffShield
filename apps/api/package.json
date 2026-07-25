@@ -5,8 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:worker": "tsx watch src/worker.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "start:worker": "node dist/worker.js",
+    "db:migrate": "tsx src/migrate.ts",
+    "test:integration": "node --import tsx/esm --test --test-reporter=junit --test-reporter-destination=test-results.xml src/__tests__/integration/bonds.test.ts",
+    "benchmark": "bash tests/load/run-all.sh",
+    "lint": "eslint --max-warnings 0 src",
+    "lint:fix": "eslint --fix src",
+    "format:check": "prettier --check .",
+    "format": "prettier --write ."
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
@@ -20,7 +29,10 @@
     "@stellar/stellar-sdk": "^15.0.0",
     "@tariffshield/sdk": "*",
     "bcryptjs": "^3.0.0",
+    "bullmq": "^5.10.0",
+    "compression": "^1.8.1",
     "cors": "^2.8.6",
+    "ioredis": "^5.4.0",
     "debug": "^4.4.3",
     "dotenv": "^16.4.7",
     "express": "^5.0.0",
@@ -33,6 +45,7 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.17",
     "@types/debug": "^4.1.13",
     "@types/express": "^5.0.0",
