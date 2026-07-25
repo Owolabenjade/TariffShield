@@ -523,11 +523,97 @@ export async function migrate(): Promise<void> {
 
     ALTER TABLE bond_records ADD COLUMN IF NOT EXISTS state_code TEXT NOT NULL DEFAULT 'CA';
     ALTER TABLE importers ADD COLUMN IF NOT EXISTS business_state TEXT NOT NULL DEFAULT 'CA';
+
+    -- #251: surety-dashboard aggregate statistics, pre-computed instead of a
+    -- live GROUP BY over importers/bond_records/contract_events on every
+    -- page load. See apps/api/migrations/002_importer_metrics_mv.sql for the
+    -- full metric-definition rationale.
+    CREATE MATERIALIZED VIEW IF NOT EXISTS importer_metrics_mv AS
+    SELECT
+      1 AS singleton_id,
+      (SELECT COUNT(*) FROM importers) AS total_importers,
+      (SELECT COALESCE(SUM(bond_amount), 0) FROM bond_records) AS total_bond_value,
+      (SELECT ROUND(COALESCE(AVG(collateral_balance), 0)) FROM importers) AS avg_balance,
+      (
+        SELECT CASE WHEN COUNT(*) = 0 THEN 100.0
+          ELSE ROUND(100.0 * COUNT(*) FILTER (WHERE bond_amount >= cbp_minimum_required) / COUNT(*), 2)
+        END
+        FROM bond_records
+      ) AS compliance_rate,
+      (
+        SELECT COUNT(*) FROM contract_events
+        WHERE kind IN ('deposit_collateral', 'deposit_reserve', 'auto_top_up')
+          AND created_at >= now() - INTERVAL '30 days'
+      ) AS topup_count_30d,
+      now() AS refreshed_at;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_mv_singleton
+      ON importer_metrics_mv (singleton_id);
   `,
     undefined,
     "migrate_schema",
   );
   console.log("[migrate] schema ready");
+}
+
+// ── importer_metrics_mv (#251) ────────────────────────────────────────────────
+
+export interface ImporterMetrics {
+  totalImporters: number;
+  totalBondValue: string;
+  avgBalance: string;
+  complianceRate: number;
+  topupCount30d: number;
+  refreshedAt: string;
+}
+
+/**
+ * Read the pre-computed dashboard statistics from importer_metrics_mv.
+ * Backed by a unique index on the (single-row) view, so this is a fast
+ * indexed lookup rather than a live aggregate — target < 5ms p95.
+ */
+export async function getImporterMetrics(): Promise<ImporterMetrics> {
+  const result = await timedQuery<{
+    total_importers: number;
+    total_bond_value: string;
+    avg_balance: string;
+    compliance_rate: string;
+    topup_count_30d: number;
+    refreshed_at: Date;
+  }>("SELECT * FROM importer_metrics_mv WHERE singleton_id = 1", undefined, "select_importer_metrics_mv");
+
+  const row = result.rows[0];
+  if (!row) {
+    return {
+      totalImporters: 0,
+      totalBondValue: "0",
+      avgBalance: "0",
+      complianceRate: 100,
+      topupCount30d: 0,
+      refreshedAt: new Date(0).toISOString(),
+    };
+  }
+
+  return {
+    totalImporters: row.total_importers,
+    totalBondValue: row.total_bond_value,
+    avgBalance: row.avg_balance,
+    complianceRate: Number(row.compliance_rate),
+    topupCount30d: row.topup_count_30d,
+    refreshedAt: row.refreshed_at.toISOString(),
+  };
+}
+
+/**
+ * Refresh importer_metrics_mv without blocking concurrent reads.
+ * Requires the unique index created alongside the view (see migrate()).
+ */
+export async function refreshImporterMetrics(): Promise<void> {
+  await timedQuery(
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY importer_metrics_mv",
+    undefined,
+    "refresh_importer_metrics_mv",
+  );
 }
 
 export async function getLastProcessedLedger(): Promise<number | null> {

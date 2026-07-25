@@ -53,6 +53,15 @@ export interface ImporterDetail {
   events: ContractEvent[];
 }
 
+export interface ImporterMetrics {
+  totalImporters: number;
+  totalBondValue: string;
+  avgBalance: string;
+  complianceRate: number;
+  topupCount30d: number;
+  refreshedAt: string;
+}
+
 async function request<T>(path: string, options: { method?: string; body?: unknown; auth?: boolean } = {}): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (options.auth !== false) {
@@ -84,6 +93,7 @@ export const api = {
   createImporter: (b: { legalName: string; ein?: string; bondId: number; initialRequiredCollateral: string }) =>
     request<{ importer: Importer }>("/importers", { method: "POST", body: b }),
   listImporters: () => request<{ importers: Importer[] }>("/importers"),
+  getStats: () => request<{ metrics: ImporterMetrics }>("/importers/stats"),
   prefetchImporter: (id: string) => {
     if (importerPrefetchCache.has(id)) return;
     const p = request<ImporterDetail>(`/importers/${id}`);
