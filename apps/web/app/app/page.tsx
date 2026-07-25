@@ -3,6 +3,9 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Nav } from "@/components/Nav";
+import { HealthScore } from "@/components/HealthScore";
+import { DepositWizard } from "@/components/DepositWizard";
+import { BondTimeline } from "@/components/BondTimeline";
 import { api, ApiError, type Importer, type ImporterDetail, stroopsToXlm } from "@/lib/api";
 import { getUser, isAuthenticated } from "@/lib/auth";
 import * as Sentry from "@sentry/nextjs";
@@ -102,11 +105,13 @@ function ImporterDashboard() {
           </div>
         ) : null}
 
-        <div className="mt-6 grid gap-4 sm:grid-cols-4">
+        <div className="mt-6 grid gap-4 sm:grid-cols-5">
+          <div className="sm:col-span-2">
+            <HealthScore collateral={collateral} required={required} reserve={reserve} />
+          </div>
           <Stat label="Required collateral" value={`${stroopsToXlm(onc.requiredCollateral)} XLM`} hint={oracleNote()} />
           <Stat label="Posted collateral" value={`${stroopsToXlm(onc.collateralBalance)} XLM`} accent={shortfall > 0n ? "danger" : "success"} />
           <Stat label="Reserve (auto-top-up pool)" value={`${stroopsToXlm(onc.reserveBalance)} XLM`} />
-          <Stat label="Yield accrued (sim BENJI)" value={`${stroopsToXlm(onc.yieldAccrued)} XLM`} accent="success" />
         </div>
 
         <div className="mt-4 rounded-lg border border-border bg-card p-4">
@@ -136,12 +141,12 @@ function ImporterDashboard() {
                         action={<TariffForm importerId={importer.id} onDone={refresh} setError={setError} />}
                         busy={busy === "tariff"} />
             <ActionCard title="Deposit collateral"
-                        description="Send USDC into the bond escrow bucket."
-                        action={<DepositForm importerId={importer.id} bucket="collateral" onDone={refresh} setError={setError} />}
+                        description="Send XLM into the bond escrow bucket. 4-step wizard guides you through the process."
+                        action={<DepositWizard importerId={importer.id} bucket="collateral" onDone={refresh} setError={setError} />}
                         busy={busy === "deposit-collateral"} />
             <ActionCard title="Deposit reserve"
-                        description="Top up the auto-top-up pool for tariff spike events."
-                        action={<DepositForm importerId={importer.id} bucket="reserve" onDone={refresh} setError={setError} />}
+                        description="Top up the auto-top-up pool for tariff spike events. 4-step wizard guides you through the process."
+                        action={<DepositWizard importerId={importer.id} bucket="reserve" onDone={refresh} setError={setError} />}
                         busy={busy === "deposit-reserve"} />
           </div>
         )}
@@ -164,6 +169,8 @@ function ImporterDashboard() {
         )}
 
         {error ? <p className="mt-4 rounded border border-danger bg-danger/10 px-3 py-2 text-sm text-danger">{error}</p> : null}
+
+        <BondTimeline events={detail.events} />
 
         <div className="mt-10">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">On-chain event log</h2>
@@ -239,32 +246,6 @@ function TariffForm({ importerId, onDone, setError }: { importerId: string; onDo
       <button onClick={go} disabled={busy}
         className="rounded-md border border-accent text-accent px-3 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground disabled:opacity-50">
         {busy ? "…" : "Apply"}
-      </button>
-    </div>
-  );
-}
-
-function DepositForm({ importerId, bucket, onDone, setError }: { importerId: string; bucket: "collateral" | "reserve"; onDone: () => Promise<void>; setError: (e: string | null) => void }) {
-  const [xlm, setXlm] = useState("50");
-  const [busy, setBusy] = useState(false);
-  async function go() {
-    setBusy(true);
-    setError(null);
-    try {
-      const stroops = (BigInt(Math.round(Number(xlm) * 1e7))).toString();
-      await api.deposit(importerId, { amountStroops: stroops, bucket });
-      await onDone();
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
-    } finally { setBusy(false); }
-  }
-  return (
-    <div className="flex gap-2">
-      <input type="number" step="0.1" min="0.1" value={xlm} onChange={(e) => setXlm(e.target.value)}
-        placeholder="XLM" className="flex-1 rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:border-accent focus:outline-none" />
-      <button onClick={go} disabled={busy}
-        className="rounded-md bg-accent text-accent-foreground px-3 py-1.5 text-sm hover:opacity-90 disabled:opacity-50">
-        {busy ? "…" : "Deposit"}
       </button>
     </div>
   );
