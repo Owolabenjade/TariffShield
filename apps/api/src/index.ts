@@ -26,6 +26,7 @@ import { privacyReacceptanceGate } from "./auth.js";
 import { complianceRouter } from "./routes/compliance.js";
 import { kycRouter } from "./routes/kyc.js";
 import { startComplianceReportScheduler } from "./jobs/compliance-report.js";
+import { startImporterMetricsScheduler } from "./jobs/refresh-importer-metrics.js";
 import { suretyLicenseRouter } from "./routes/surety-license.js";
 import { regulatoryRouter } from "./routes/regulatory.js";
 import { healthRouter } from "./routes/health.js";
@@ -329,6 +330,7 @@ async function start() {
   await startOracleMonitor();
   await startOracleEventListener();
   startComplianceReportScheduler();
+  startImporterMetricsScheduler();
   app.listen(env.PORT, () => {
     console.log(`[boot] tariffshield API on :${env.PORT}`);
     console.log(`[boot] contract: ${env.TARIFF_SHIELD_CONTRACT_ID}`);

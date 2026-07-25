@@ -11,6 +11,7 @@
     "start:worker": "node dist/worker.js",
     "db:migrate": "tsx src/migrate.ts",
     "test:integration": "node --import tsx/esm --test --test-reporter=junit --test-reporter-destination=test-results.xml src/__tests__/integration/bonds.test.ts",
+    "benchmark": "bash tests/load/run-all.sh",
     "lint": "eslint --max-warnings 0 src",
     "lint:fix": "eslint --fix src",
     "format:check": "prettier --check .",

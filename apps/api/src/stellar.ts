@@ -126,17 +126,9 @@ export async function pingRpc(): Promise<void> {
  * @returns The on-chain collateral balance as a string.
  */
 export async function getBondOnChain(stellarAddress: string): Promise<string> {
+  // Use the contractClient proxy which already has metric instrumentation.
   const acct = await contractClient.getAccount(stellarAddress);
   return acct.collateralBalance.toString();
-}
-
-/**
- * Retrieves the required_collateral for an importer address from the contract.
- */
-export async function getBondOnChain(stellarAddress: string): Promise<string> {
-  // Use the contractClient proxy which already has metric instrumentation
-  const account = await contractClient.getAccount(stellarAddress);
-  return account.collateralBalance.toString();
 }
 
 /**

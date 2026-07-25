@@ -1,9 +1,9 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, memo } from "react";
 import { Nav } from "@/components/Nav";
-import { api, ApiError, type Importer, type ImporterDetail, stroopsToXlm } from "@/lib/api";
+import { api, ApiError, type Importer, type ImporterDetail, type ContractEvent, stroopsToXlm } from "@/lib/api";
 import { getUser, isAuthenticated } from "@/lib/auth";
 import * as Sentry from "@sentry/nextjs";
 
@@ -14,14 +14,7 @@ function ImporterDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!isAuthenticated()) { router.replace("/login"); return; }
-    const user = getUser();
-    if (user?.role !== "importer") { router.replace("/surety"); return; }
-    refresh();
-  }, [router]);
-
-  async function refresh() {
+  const refresh = useCallback(async () => {
     try {
       const list = await api.listImporters();
       if (list.importers.length === 0) {
@@ -36,9 +29,9 @@ function ImporterDashboard() {
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     }
-  }
+  }, []);
 
-  async function action(name: string, fn: () => Promise<unknown>) {
+  const action = useCallback(async (name: string, fn: () => Promise<unknown>) => {
     setBusy(name);
     setError(null);
     try {
@@ -49,7 +42,19 @@ function ImporterDashboard() {
     } finally {
       setBusy(null);
     }
-  }
+  }, [refresh]);
+
+  const handleTopUp = useCallback(() => {
+    if (!importer) return;
+    return action("topup", () => api.autoTopUp(importer.id));
+  }, [action, importer]);
+
+  useEffect(() => {
+    if (!isAuthenticated()) { router.replace("/login"); return; }
+    const user = getUser();
+    if (user?.role !== "importer") { router.replace("/surety"); return; }
+    refresh();
+  }, [router, refresh]);
 
   if (!importer) {
     return (
@@ -65,13 +70,17 @@ function ImporterDashboard() {
   }
 
   const onc = detail.onChainAccount;
-  const required = BigInt(onc.requiredCollateral);
-  const collateral = BigInt(onc.collateralBalance);
-  const reserve = BigInt(onc.reserveBalance);
-  const yieldAcc = BigInt(onc.yieldAccrued);
-  const shortfall = required > collateral ? required - collateral : 0n;
-  const excess = collateral > required ? collateral - required : 0n;
-  const utilization = required === 0n ? 0 : Number((collateral * 100n) / required);
+
+  // Derived values recomputed only when the on-chain account snapshot changes,
+  // not on every render triggered by unrelated state (busy, error, etc.).
+  const { required, collateral, shortfall, excess, utilization } = useMemo(() => {
+    const required = BigInt(onc.requiredCollateral);
+    const collateral = BigInt(onc.collateralBalance);
+    const shortfall = required > collateral ? required - collateral : 0n;
+    const excess = collateral > required ? collateral - required : 0n;
+    const utilization = required === 0n ? 0 : Number((collateral * 100n) / required);
+    return { required, collateral, shortfall, excess, utilization };
+  }, [onc.requiredCollateral, onc.collateralBalance]);
 
   return (
     <>
@@ -102,32 +111,12 @@ function ImporterDashboard() {
           </div>
         ) : null}
 
-        <div className="mt-6 grid gap-4 sm:grid-cols-4">
-          <Stat label="Required collateral" value={`${stroopsToXlm(onc.requiredCollateral)} XLM`} hint={oracleNote()} />
-          <Stat label="Posted collateral" value={`${stroopsToXlm(onc.collateralBalance)} XLM`} accent={shortfall > 0n ? "danger" : "success"} />
-          <Stat label="Reserve (auto-top-up pool)" value={`${stroopsToXlm(onc.reserveBalance)} XLM`} />
-          <Stat label="Yield accrued (sim BENJI)" value={`${stroopsToXlm(onc.yieldAccrued)} XLM`} accent="success" />
-        </div>
-
-        <div className="mt-4 rounded-lg border border-border bg-card p-4">
-          <div className="flex items-center justify-between text-sm mb-2">
-            <span className="text-muted">Bond utilization</span>
-            <span className="font-mono">{utilization}%</span>
-          </div>
-          <div className="h-2 bg-border rounded overflow-hidden">
-            <div className={`h-full ${shortfall > 0n ? "bg-danger" : "bg-success"}`}
-                 style={{ width: `${Math.min(utilization, 100)}%` }} />
-          </div>
-          {shortfall > 0n ? (
-            <p className="mt-2 text-xs text-danger">
-              Shortfall <span className="font-mono">{stroopsToXlm(shortfall.toString())} XLM</span> — auto-top-up will draw from reserve.
-            </p>
-          ) : excess > 0n ? (
-            <p className="mt-2 text-xs text-success">
-              Excess <span className="font-mono">{stroopsToXlm(excess.toString())} XLM</span> — withdrawable.
-            </p>
-          ) : null}
-        </div>
+        <BalanceSummary
+          onChainAccount={onc}
+          shortfall={shortfall}
+          excess={excess}
+          utilization={utilization}
+        />
 
         {!onc.isClawbacked && (
           <div className="mt-6 grid gap-4 sm:grid-cols-3">
@@ -149,7 +138,7 @@ function ImporterDashboard() {
         {!onc.isClawbacked && (
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
             <button
-              onClick={() => action("topup", () => api.autoTopUp(importer.id))}
+              onClick={handleTopUp}
               disabled={busy !== null || shortfall === 0n}
               className="rounded-md bg-accent px-4 py-3 text-accent-foreground hover:opacity-90 disabled:opacity-40 text-sm font-medium"
             >
@@ -172,18 +161,7 @@ function ImporterDashboard() {
           ) : (
             <ul className="mt-3 divide-y divide-border rounded-lg border border-border bg-card overflow-hidden">
               {detail.events.map((e) => (
-                <li key={e.id} className="px-4 py-3 flex items-center justify-between gap-4">
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium">{e.kind}</p>
-                    <p className="text-xs text-muted">{new Date(e.createdAt).toLocaleString()}</p>
-                  </div>
-                  <span className="text-sm font-mono">{e.amount ? `${stroopsToXlm(e.amount)} XLM` : "—"}</span>
-                  {e.txUrl ? (
-                    <a href={e.txUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-accent hover:underline font-mono">
-                      {e.txHash.slice(0, 8)}…
-                    </a>
-                  ) : null}
-                </li>
+                <EventLogRow key={e.id} event={e} />
               ))}
             </ul>
           )}
@@ -197,7 +175,12 @@ function oracleNote() {
   return "Set by platform admin acting as tariff oracle";
 }
 
-function Stat({ label, value, hint, accent }: { label: string; value: string; hint?: string; accent?: "success" | "danger" }) {
+/**
+ * MetricsCard equivalent (#254): a single stat tile. Memoized so a re-render
+ * of the parent dashboard doesn't re-render every tile unless its own
+ * label/value/hint/accent actually changed.
+ */
+const Stat = memo(function Stat({ label, value, hint, accent }: { label: string; value: string; hint?: string; accent?: "success" | "danger" }) {
   const color = accent === "success" ? "text-success" : accent === "danger" ? "text-danger" : "text-foreground";
   return (
     <div className="rounded-lg border border-border bg-card p-4">
@@ -206,7 +189,94 @@ function Stat({ label, value, hint, accent }: { label: string; value: string; hi
       {hint ? <p className="mt-1 text-xs text-muted">{hint}</p> : null}
     </div>
   );
-}
+});
+
+/**
+ * BalanceSummary (#254): the four balance tiles + utilization bar. Formatted
+ * XLM strings and the bar's derived class/width are memoized so this block
+ * only re-renders when the underlying on-chain account snapshot changes,
+ * not on every parent re-render (e.g. toggling `busy`/`error`).
+ */
+const BalanceSummary = memo(function BalanceSummary({
+  onChainAccount,
+  shortfall,
+  excess,
+  utilization,
+}: {
+  onChainAccount: ImporterDetail["onChainAccount"];
+  shortfall: bigint;
+  excess: bigint;
+  utilization: number;
+}) {
+  const formatted = useMemo(
+    () => ({
+      required: stroopsToXlm(onChainAccount.requiredCollateral),
+      collateral: stroopsToXlm(onChainAccount.collateralBalance),
+      reserve: stroopsToXlm(onChainAccount.reserveBalance),
+      yieldAccrued: stroopsToXlm(onChainAccount.yieldAccrued),
+      shortfall: stroopsToXlm(shortfall.toString()),
+      excess: stroopsToXlm(excess.toString()),
+    }),
+    [onChainAccount.requiredCollateral, onChainAccount.collateralBalance, onChainAccount.reserveBalance, onChainAccount.yieldAccrued, shortfall, excess],
+  );
+
+  return (
+    <>
+      <div className="mt-6 grid gap-4 sm:grid-cols-4">
+        <Stat label="Required collateral" value={`${formatted.required} XLM`} hint={oracleNote()} />
+        <Stat label="Posted collateral" value={`${formatted.collateral} XLM`} accent={shortfall > 0n ? "danger" : "success"} />
+        <Stat label="Reserve (auto-top-up pool)" value={`${formatted.reserve} XLM`} />
+        <Stat label="Yield accrued (sim BENJI)" value={`${formatted.yieldAccrued} XLM`} accent="success" />
+      </div>
+
+      <div className="mt-4 rounded-lg border border-border bg-card p-4">
+        <div className="flex items-center justify-between text-sm mb-2">
+          <span className="text-muted">Bond utilization</span>
+          <span className="font-mono">{utilization}%</span>
+        </div>
+        <div className="h-2 bg-border rounded overflow-hidden">
+          <div className={`h-full ${shortfall > 0n ? "bg-danger" : "bg-success"}`}
+               style={{ width: `${Math.min(utilization, 100)}%` }} />
+        </div>
+        {shortfall > 0n ? (
+          <p className="mt-2 text-xs text-danger">
+            Shortfall <span className="font-mono">{formatted.shortfall} XLM</span> — auto-top-up will draw from reserve.
+          </p>
+        ) : excess > 0n ? (
+          <p className="mt-2 text-xs text-success">
+            Excess <span className="font-mono">{formatted.excess} XLM</span> — withdrawable.
+          </p>
+        ) : null}
+      </div>
+    </>
+  );
+});
+
+/**
+ * EventLogRow (#254): a single on-chain event row. Memoized so unrelated
+ * dashboard re-renders (busy state, error banner, form inputs) don't
+ * re-render the full event list — only rows whose own event data changed.
+ */
+const EventLogRow = memo(function EventLogRow({ event }: { event: ContractEvent }) {
+  const amountLabel = useMemo(
+    () => (event.amount ? `${stroopsToXlm(event.amount)} XLM` : "—"),
+    [event.amount],
+  );
+  return (
+    <li className="px-4 py-3 flex items-center justify-between gap-4">
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium">{event.kind}</p>
+        <p className="text-xs text-muted">{new Date(event.createdAt).toLocaleString()}</p>
+      </div>
+      <span className="text-sm font-mono">{amountLabel}</span>
+      {event.txUrl ? (
+        <a href={event.txUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-accent hover:underline font-mono">
+          {event.txHash.slice(0, 8)}…
+        </a>
+      ) : null}
+    </li>
+  );
+});
 
 function ActionCard({ title, description, action, busy }: { title: string; description: string; action: React.ReactNode; busy: boolean }) {
   return (

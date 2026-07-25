@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { createHash } from "crypto";
 import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import { pool } from "../db.js";
+import { pool, getImporterMetrics } from "../db.js";
 import { authMiddleware, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { requireLicenseVerified } from "./surety-license.js";
 import { contractClient, explorerTx, platformKeypair, suretyKeypair } from "../stellar.js";
@@ -149,6 +149,20 @@ importersRouter.get("/", async (req: Request, res: Response) => {
     );
   }
   res.json({ importers: r.rows });
+});
+
+// #251: surety-dashboard aggregate statistics, served from importer_metrics_mv
+// (a materialized view refreshed on a 5-minute schedule — see
+// jobs/refresh-importer-metrics.ts) instead of live GROUP BY queries.
+// Registered before "/:id" so Express doesn't treat "stats" as an :id param.
+importersRouter.get("/stats", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== "surety_admin") {
+    res.status(403).json({ error: "surety admin only" });
+    return;
+  }
+  const metrics = await getImporterMetrics();
+  res.json({ metrics });
 });
 
 async function loadImporterFor(req: Request, importerId: string) {

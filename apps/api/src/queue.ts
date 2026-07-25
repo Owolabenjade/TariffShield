@@ -25,6 +25,18 @@ const connection = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null, enable
 
 export const txSubmitQueue = new Queue<TxSubmitJobData, TxSubmitJobResult>("tx-submit", { connection });
 
+/**
+ * Pings Redis to check connectivity (#263 — used by GET /health for load
+ * balancer probes). Reuses the same connection the job queue runs on rather
+ * than opening a second one.
+ */
+export async function pingRedis(): Promise<void> {
+  const reply = await connection.ping();
+  if (reply !== "PONG") {
+    throw new Error(`unexpected Redis PING reply: ${reply}`);
+  }
+}
+
 export async function enqueueTxSubmit(data: TxSubmitJobData): Promise<string> {
   const job = await txSubmitQueue.add("submit", data, {
     attempts: 2,

@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { ping } from "../db.js";
 import { pingRpc } from "../stellar.js";
+import { pingRedis } from "../queue.js";
 import { env, isProduction } from "../config/env.js";
 import { readFileSync } from "fs";
 import { join } from "path";
@@ -17,6 +18,7 @@ healthRouter.get("/", async (_req, res) => {
   const checks = {
     db: "connected",
     soroban: "ok",
+    redis: "connected",
   };
   let hasError = false;
 
@@ -31,6 +33,13 @@ healthRouter.get("/", async (_req, res) => {
     await pingRpc();
   } catch (err) {
     checks.soroban = "failed";
+    hasError = true;
+  }
+
+  try {
+    await pingRedis();
+  } catch (err) {
+    checks.redis = "failed";
     hasError = true;
   }
 
@@ -58,7 +67,7 @@ healthRouter.get("/live", (_req, res) => {
 
 healthRouter.get("/ready", async (_req, res) => {
   try {
-    await Promise.all([ping(), pingRpc()]);
+    await Promise.all([ping(), pingRpc(), pingRedis()]);
     res.status(200).send("OK");
   } catch (err) {
     res.status(503).send("Service Unavailable");
