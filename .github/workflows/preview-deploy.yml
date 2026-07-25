@@ -12,8 +12,17 @@ jobs:
       pull-requests: write
       deployments: write
 
+    env:
+      SERVICE: Web (Vercel Preview)
+      ENVIRONMENT: preview
+      DEPLOYER: ${{ github.actor }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set short SHA
+        run: echo "SHORT_SHA=$(echo '${{ github.event.pull_request.head.sha }}' | cut -c1-7)" >> "$GITHUB_ENV"
 
       - name: Deploy to Vercel preview
         id: vercel
@@ -29,3 +38,23 @@ jobs:
         env:
           VERCEL_ENV: preview
           NEXT_PUBLIC_API_URL: ${{ vars.STAGING_API_URL }}
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/[email protected]
+        with:
+          webhook: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload-file-path: ./.github/slack/deploy-success.json
+          payload-templated: true
+        env:
+          DEPLOY_URL: ${{ steps.vercel.outputs.preview-url }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/[email protected]
+        with:
+          webhook: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload-file-path: ./.github/slack/deploy-failure.json
+          payload-templated: true

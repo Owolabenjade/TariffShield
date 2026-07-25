@@ -1,0 +1,7 @@
+# Glob patterns (same format as .gitignore) excluded from the PR size count
+# in .github/workflows/pr-size.yml.
+package-lock.json
+Cargo.lock
+*.snap
+dist/**
+target/**

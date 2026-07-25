@@ -1,39 +1,93 @@
 # Contributing to TariffShield
 
+## Prerequisites
+
+| Tool | Minimum version | Notes |
+|------|------------------|-------|
+| Node.js | 20+ | Pinned via root `package.json` `engines.node` |
+| npm | 10+ | Ships with Node 20 |
+| Rust | stable (2021 edition) | No strict MSRV pinned — see `Cargo.toml` / `contracts/tariff-shield/Cargo.toml` |
+| `wasm32-unknown-unknown` target | — | `rustup target add wasm32-unknown-unknown` |
+| Stellar CLI | latest | https://developers.stellar.org/docs/tools/cli |
+| Docker Desktop | latest | Runs local Postgres via `docker-compose.yml` |
+| PostgreSQL client (`psql`) | any recent | For inspecting the local database directly |
+
 ## Development Setup
 
-See [README.md](README.md) for full environment setup instructions (Docker Compose, Stellar testnet, PostgreSQL, and contract deployment steps).
-
-Quick start:
+See [README.md](README.md) for the full walkthrough (Docker Compose, Stellar testnet, contract deployment). Numbered setup from a fresh clone:
 
 ```bash
+# 1. Clone and install
+git clone https://github.com/vjuliaife/TariffShield.git && cd TariffShield
 npm install
-cp .env.example .env   # fill in required secrets
-npm run seed           # seed local database
-npm run dev:api        # start Express API on :3001
-npm run dev:web        # start Next.js dashboard on :3000
+
+# 2. Rust toolchain
+rustup target add wasm32-unknown-unknown
+
+# 3. Local Postgres (and API/web/Jaeger if you want the full stack — see README "Local Development")
+docker-compose up -d
+
+# 4. Configure env
+cp .env.example .env
+cp .env apps/api/.env
+cp apps/web/.env.example apps/web/.env.local
+
+# 5. Run database migrations
+npm run db:migrate --workspace=apps/api
+
+# 6. (Optional) seed local database
+npm run seed
+
+# 7. Start the API and web app
+npm run dev:api      # API on :3002
+npm run dev:web      # Web on :3000
+
+# 8. Verify the API is up
+curl -f http://localhost:3002/health   # should return 200
 ```
 
-### Code Formatting & Linting
+See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment issues.
 
-Before pushing your changes, please ensure that your Rust code is properly formatted. You can run formatting locally:
+### Code Style
 
-```bash
-cargo fmt --all
-```
+- **TypeScript** (`apps/api`, `apps/web`, `packages/sdk`): `strict` mode is enabled in every `tsconfig.json` — do not disable it or add `any` to work around a type error. Follow the existing import order (external packages, then internal `@tariffshield/*` / relative imports). Run before pushing:
+  ```bash
+  npm run typecheck --workspace=apps/web
+  npm run lint --workspace=apps/api      # eslint --max-warnings 0
+  npm run lint --workspace=apps/web
+  npm run format:check --workspace=apps/api
+  ```
+- **Rust** (`contracts/tariff-shield`): zero `clippy` warnings and `rustfmt`-clean. Run before pushing:
+  ```bash
+  cargo fmt --all
+  cargo clippy --workspace --all-targets --all-features -- -D warnings
+  ```
 
-To automate this check before committing, we suggest setting up a Git `pre-commit` hook. In `.git/hooks/pre-commit` (or using a tool like `husky`), you can add the following to check formatting:
+To automate the Rust format check before committing, set up a Git `pre-commit` hook (`.git/hooks/pre-commit`, or a tool like `husky`):
 
 ```bash
 #!/bin/sh
 cargo fmt --all -- --check
 ```
 
+### Testing
+
+| Suite | Command |
+|-------|---------|
+| Contract unit tests | `cargo test --workspace` (or `npm run contract:test`) |
+| API integration tests | `npm run test:integration --workspace=apps/api` |
+| SDK tests | `packages/sdk` has no dedicated test script yet — type-check it with `npm run build --workspace=packages/sdk` and exercise it via the API integration tests, which run against the real SDK client |
+| End-to-end tests | `npx playwright test` (from `apps/web`; see `apps/web/package.json` `test:e2e`) |
+
+CI runs the contract, typecheck, and lint suites on every PR — see `.github/workflows/ci.yml` and `.github/workflows/contract.yml`.
+
 ---
 
 ## Pull Request Process
 
-All PRs must target the `main` branch. When you open a PR, GitHub will pre-populate the body from [`.github/pull_request_template.md`](.github/pull_request_template.md). Fill in each section:
+All PRs must target the `main` branch. Name your branch by change type, matching the Conventional Commits types below: `feat/short-description`, `fix/short-description`, `docs/short-description`, `chore/short-description`, etc.
+
+When you open a PR, GitHub will pre-populate the body from [`.github/pull_request_template.md`](.github/pull_request_template.md). Fill in each section:
 
 | Section | Purpose |
 |---------|---------|
@@ -49,6 +103,15 @@ All PRs must target the `main` branch. When you open a PR, GitHub will pre-popul
 - At least one approving review is required before merge (enforced by branch protection).
 - The CI suite (type-check, lint, contract tests, audit) must pass.
 - Keep PRs focused — one feature or fix per PR. Large refactors should be discussed in an issue first.
+
+### Pull Request Guidelines (size)
+
+The `.github/workflows/pr-size.yml` check counts added + removed lines against the PR base (excluding generated files listed in `.prsize-ignore`, e.g. `package-lock.json`, `Cargo.lock`, `*.snap`, `dist/`, `target/`):
+
+- **400–999 lines**: the bot leaves a comment suggesting you split the PR. This does not block merge.
+- **1000+ lines**: the check fails and blocks merge, unless a maintainer applies the `large-pr-approved` label for an explicit sign-off.
+
+If your change is trending large, split it: land groundwork/refactors first in their own PR, separate generated/vendored file changes from hand-written logic, and land a feature behind a flag in small increments rather than as one PR.
 
 ---
 
@@ -135,3 +198,13 @@ Releases are automated via [semantic-release](https://semantic-release.gitbook.i
 | `BREAKING CHANGE` footer | Major (`x.0.0`) |
 
 `chore`, `docs`, `ci`, and `test` commits do not trigger a release. `semantic-release` writes the updated version to `package.json` (root and workspaces), appends an entry to [`CHANGELOG.md`](CHANGELOG.md), and creates a GitHub Release with generated release notes.
+
+---
+
+## Getting Help
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — technical deep-dive on the contract, API, and web app
+- [docs/local-dev.md](docs/local-dev.md) — local environment setup and troubleshooting
+- [docs/OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md) — surety admin / emergency clawback procedure
+- [docs/FAQ.md](docs/FAQ.md) — general project FAQ
+- Stuck or found a bug? Open a GitHub issue — that's the preferred channel for contributor questions on this repo.
