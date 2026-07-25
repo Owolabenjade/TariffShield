@@ -1,0 +1,101 @@
+name: PR Size Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+env:
+  PR_SIZE_WARN: 400
+  PR_SIZE_FAIL: 1000
+
+jobs:
+  size-check:
+    name: size-check
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Count changed lines (excluding .prsize-ignore patterns)
+        id: count
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          PATHSPECS=(".")
+          if [ -f .prsize-ignore ]; then
+            while IFS= read -r pattern; do
+              case "$pattern" in
+                ""|\#*) continue ;;
+              esac
+              PATHSPECS+=(":(exclude)$pattern")
+            done < .prsize-ignore
+          fi
+
+          LINES=$(git diff --numstat "$BASE_SHA" "$HEAD_SHA" -- "${PATHSPECS[@]}" \
+            | awk '{added+=$1; removed+=$2} END {print added+removed+0}')
+
+          echo "lines=$LINES" >> "$GITHUB_OUTPUT"
+          echo "PR diff size (excluding ignored files): $LINES lines"
+
+      - name: Evaluate size against thresholds
+        id: evaluate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const lines = parseInt("${{ steps.count.outputs.lines }}", 10);
+            const warn = parseInt(process.env.PR_SIZE_WARN, 10);
+            const fail = parseInt(process.env.PR_SIZE_FAIL, 10);
+
+            const labels = context.payload.pull_request.labels.map((l) => l.name);
+            const bypassed = labels.includes("large-pr-approved");
+
+            const marker = "<!-- pr-size-check -->";
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body.includes(marker));
+
+            async function upsertComment(body) {
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body: `${marker}\n${body}`,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: `${marker}\n${body}`,
+                });
+              }
+            }
+
+            if (lines >= fail) {
+              if (bypassed) {
+                await upsertComment(
+                  `🚨 This PR is very large (**${lines} lines**, hard limit is ${fail}), but the \`large-pr-approved\` label lets it bypass the size check.`,
+                );
+                core.info(`PR is ${lines} lines (>= ${fail}) but bypassed via 'large-pr-approved' label.`);
+              } else {
+                await upsertComment(
+                  `🚨 **This PR exceeds the hard size limit** (${lines} lines, limit is ${fail}).\n\nPlease split this PR into smaller, independently reviewable pieces. If this size is unavoidable (e.g. a generated migration or vendored update), ask a maintainer to apply the \`large-pr-approved\` label to bypass this check.`,
+                );
+                core.setFailed(`PR diff is ${lines} lines, exceeding the ${fail}-line hard limit.`);
+              }
+            } else if (lines >= warn) {
+              await upsertComment(
+                `⚠️ This PR is large (${lines} lines). Consider splitting it into smaller PRs for easier review.`,
+              );
+              core.info(`PR is ${lines} lines (>= ${warn} warn threshold, < ${fail} fail threshold) — not blocking.`);
+            } else {
+              core.info(`PR is ${lines} lines — under the ${warn}-line warn threshold.`);
+            }
