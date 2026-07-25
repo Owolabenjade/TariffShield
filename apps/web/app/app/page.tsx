@@ -1,10 +1,27 @@
 "use client";
 
+// #256: this page stays a Client Component rather than converting to an
+// async Server Component. Authentication here is a pure client-side
+// mechanism — the JWT lives in localStorage only (see lib/auth.ts), never
+// in a cookie — so a Server Component running at request time on the server
+// has no way to read the current user's token and would not be able to
+// perform the authenticated fetch the SSR conversion depends on. Doing this
+// correctly requires migrating auth to (httpOnly) cookies first, which
+// touches login/signup and every authenticated fetch call across the app —
+// a materially larger, security-sensitive change beyond this issue's
+// stated scope, so it isn't attempted here rather than shipping a Server
+// Component wrapper that can't actually authenticate.
+//
+// What *is* implemented from this issue: loading.tsx (a route-level
+// Suspense boundary Next.js wraps this page in automatically) streams an
+// immediate skeleton as the initial HTML response, improving perceived
+// TTI without requiring server-side auth.
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState, memo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, memo } from "react";
 import { Nav } from "@/components/Nav";
 import { api, ApiError, type Importer, type ImporterDetail, type ContractEvent, stroopsToXlm } from "@/lib/api";
 import { getUser, isAuthenticated } from "@/lib/auth";
+import { useYieldProjection } from "@/lib/workers/useYieldProjection";
 import * as Sentry from "@sentry/nextjs";
 
 function ImporterDashboard() {
@@ -118,6 +135,8 @@ function ImporterDashboard() {
           utilization={utilization}
         />
 
+        <YieldProjectionPanel currentBalanceStroops={onc.collateralBalance} />
+
         {!onc.isClawbacked && (
           <div className="mt-6 grid gap-4 sm:grid-cols-3">
             <ActionCard title="Update tariff exposure"
@@ -156,15 +175,7 @@ function ImporterDashboard() {
 
         <div className="mt-10">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">On-chain event log</h2>
-          {detail.events.length === 0 ? (
-            <p className="mt-3 text-sm text-muted">No events yet.</p>
-          ) : (
-            <ul className="mt-3 divide-y divide-border rounded-lg border border-border bg-card overflow-hidden">
-              {detail.events.map((e) => (
-                <EventLogRow key={e.id} event={e} />
-              ))}
-            </ul>
-          )}
+          <EventLog importerId={importer.id} />
         </div>
       </main>
     </>
@@ -251,6 +262,155 @@ const BalanceSummary = memo(function BalanceSummary({
     </>
   );
 });
+
+/**
+ * YieldProjectionPanel (#260): compound-interest / top-up-schedule scenario
+ * modeling, run in a WebWorker (lib/workers/yieldWorker.ts) instead of the
+ * main thread — recalculating on every input change would otherwise block
+ * rendering/event handling for the duration of the calculation.
+ */
+function YieldProjectionPanel({ currentBalanceStroops }: { currentBalanceStroops: string }) {
+  const [months, setMonths] = useState(24);
+  const [monthlyTopUpXlm, setMonthlyTopUpXlm] = useState("0");
+  const [annualYieldBps, setAnnualYieldBps] = useState(500); // 5%
+  const { result, error, loading, project } = useYieldProjection();
+
+  useEffect(() => {
+    const monthlyTopUpStroops = String(BigInt(Math.round(Number(monthlyTopUpXlm) * 1e7)) || 0n);
+    project({ currentBalanceStroops, monthlyTopUpStroops, months, annualYieldBps });
+    // Re-run whenever any input (or the on-chain balance) changes.
+  }, [currentBalanceStroops, monthlyTopUpXlm, months, annualYieldBps, project]);
+
+  return (
+    <div className="mt-4 rounded-lg border border-border bg-card p-4">
+      <h3 className="text-sm font-semibold">Yield projection (sim BENJI)</h3>
+      <p className="mt-1 text-xs text-muted">Computed off the main thread — typing here never blocks the UI.</p>
+
+      <div className="mt-3 grid gap-3 sm:grid-cols-3">
+        <label className="block">
+          <span className="block text-xs text-muted">Months</span>
+          <input type="number" min={1} max={600} value={months}
+            onChange={(e) => setMonths(Math.max(1, Math.min(600, Number(e.target.value) || 1)))}
+            className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:border-accent focus:outline-none" />
+        </label>
+        <label className="block">
+          <span className="block text-xs text-muted">Monthly top-up (XLM)</span>
+          <input type="number" min={0} step="0.1" value={monthlyTopUpXlm}
+            onChange={(e) => setMonthlyTopUpXlm(e.target.value)}
+            className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:border-accent focus:outline-none" />
+        </label>
+        <label className="block">
+          <span className="block text-xs text-muted">Simulated annual yield (bps)</span>
+          <input type="number" min={0} max={10000} step={10} value={annualYieldBps}
+            onChange={(e) => setAnnualYieldBps(Math.max(0, Math.min(10000, Number(e.target.value) || 0)))}
+            className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:border-accent focus:outline-none" />
+        </label>
+      </div>
+
+      <div className="mt-3">
+        {error ? (
+          <p className="text-sm text-danger">{error}</p>
+        ) : result ? (
+          <p className="text-sm">
+            Projected balance after <span className="font-mono">{result.months}</span> months:{" "}
+            <span className="font-mono font-semibold">{stroopsToXlm(result.projectedBalanceStroops)} XLM</span>{" "}
+            <span className="text-xs text-muted">
+              ({Number(result.totalYieldStroops) >= 0 ? "+" : ""}{stroopsToXlm(result.totalYieldStroops)} XLM yield)
+            </span>
+          </p>
+        ) : loading ? (
+          <p className="text-sm text-muted">Calculating…</p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * EventLog (#255): lazy-loads the event log with infinite scroll +
+ * cursor pagination. Nothing is fetched until the section (specifically,
+ * the sentinel div at its bottom) scrolls within 200px of the viewport,
+ * deferring this network call and its DOM nodes off the initial page load.
+ */
+function EventLog({ importerId }: { importerId: string }) {
+  const [events, setEvents] = useState<ContractEvent[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [started, setStarted] = useState(false);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const seenIds = useRef<Set<string>>(new Set());
+
+  const loadNextPage = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await api.getImporterEventsCursor(importerId, cursor);
+      const fresh = page.events.filter((e) => !seenIds.current.has(e.id));
+      for (const e of fresh) seenIds.current.add(e.id);
+      setEvents((prev) => [...prev, ...fresh]);
+      setCursor(page.nextCursor);
+      setHasMore(page.nextCursor !== null);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [importerId, cursor]);
+
+  // Fires the *first* page load once the sentinel enters the viewport, and
+  // every subsequent page as the user scrolls within 200px of the bottom.
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          if (!started) setStarted(true);
+          if (hasMore && !loading) loadNextPage();
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- observer re-attach is driven by loadNextPage identity
+  }, [loadNextPage, hasMore, loading, started]);
+
+  return (
+    <>
+      {!started && !loading && events.length === 0 && !error ? (
+        <p className="mt-3 text-sm text-muted">Scroll to load event history…</p>
+      ) : events.length === 0 && !loading && !error ? (
+        <p className="mt-3 text-sm text-muted">No events yet.</p>
+      ) : (
+        <ul className="mt-3 divide-y divide-border rounded-lg border border-border bg-card overflow-hidden">
+          {events.map((e) => (
+            <EventLogRow key={e.id} event={e} />
+          ))}
+        </ul>
+      )}
+
+      {loading ? (
+        <p className="mt-3 text-sm text-muted">Loading events…</p>
+      ) : error ? (
+        <div className="mt-3 flex items-center gap-3">
+          <p className="text-sm text-danger">{error}</p>
+          <button
+            onClick={loadNextPage}
+            className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-card"
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
+
+      {/* Sentinel: IntersectionObserver target, 200px above the true bottom via rootMargin. */}
+      <div ref={sentinelRef} />
+    </>
+  );
+}
 
 /**
  * EventLogRow (#254): a single on-chain event row. Memoized so unrelated

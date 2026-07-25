@@ -12,6 +12,12 @@ const cdnUrl = process.env.NEXT_PUBLIC_CDN_URL;
 const assetPrefix =
   process.env.NODE_ENV === "production" && cdnUrl ? cdnUrl : undefined;
 
+// #260: Web Worker support (lib/workers/yieldWorker.ts, instantiated via
+// `new Worker(new URL("./yieldWorker.ts", import.meta.url))`) works with
+// Next.js's default webpack 5 build out of the box — no additional
+// `config.output`/loader configuration is required for the module-worker
+// pattern used here. Noted explicitly rather than adding unused webpack
+// options just to have something under a "worker config" heading.
 const config: NextConfig = {
   reactStrictMode: true,
   assetPrefix,
