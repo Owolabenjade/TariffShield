@@ -1,0 +1,125 @@
+name: API Benchmark (k6)
+
+# Issue #265 — runs the k6 load-test suite against a seeded staging DB on
+# every PR and reports p95 latency / error rate as a PR comment.
+
+on:
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  benchmark:
+    name: k6-benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: tariffshield_bench
+          POSTGRES_USER: bench
+          POSTGRES_PASSWORD: bench
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://bench:bench@localhost:5432/tariffshield_bench
+      REDIS_URL: redis://localhost:6379
+      NODE_ENV: test
+      PORT: 3002
+      JWT_SECRET: ci-stub-jwt-secret-not-used-by-migrations-0000
+      STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+      STELLAR_HORIZON_URL: https://horizon-testnet.stellar.org
+      STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+      TARIFF_SHIELD_CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      PLATFORM_STELLAR_SECRET: SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB
+      SURETY_STELLAR_SECRET: SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC
+      API_BASE_URL: http://localhost:3002
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - run: npm ci
+
+      - name: Run database migrations
+        run: npm run db:migrate --workspace=apps/api
+
+      - name: Seed staging DB
+        run: npm run seed
+
+      - name: Start API in background
+        run: |
+          npm run build --workspace=apps/api
+          nohup npm run start --workspace=apps/api > api.log 2>&1 &
+          echo "waiting for API to become healthy..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3002/health/live > /dev/null; then
+              echo "API is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API did not become healthy in time"
+          cat api.log
+          exit 1
+
+      - name: Run k6 benchmark suite
+        id: benchmark
+        continue-on-error: true
+        run: npm run benchmark --workspace=apps/api
+
+      - name: Format results as PR comment
+        if: always()
+        run: node .github/scripts/format-benchmark-results.mjs > benchmark-comment.md
+
+      - name: Post results as PR comment
+        if: always()
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: benchmark-comment.md
+          edit-mode: replace
+
+      - name: Upload raw k6 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-benchmark-results
+          path: apps/api/tests/load/results/
+          if-no-files-found: warn
+
+      - name: Print API logs on failure
+        if: failure()
+        run: cat api.log || true
+
+      - name: Fail the job if thresholds were breached
+        if: steps.benchmark.outcome == 'failure'
+        run: exit 1
