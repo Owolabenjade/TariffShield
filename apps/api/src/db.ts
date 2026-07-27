@@ -215,6 +215,9 @@ export async function migrate(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_contract_events_importer ON contract_events(importer_id, created_at DESC);
 
+    -- #248: B-tree index on contract_events (importer_id, id DESC) to support high-performance cursor-based pagination.
+    CREATE INDEX IF NOT EXISTS idx_contract_events_importer_id_pagination ON contract_events(importer_id, id DESC);
+
     -- #245: BRIN index on contract_events.created_at for time-range queries.
     -- A B-tree index stores pointers for every single row and becomes extremely large at scale.
     -- A BRIN (Block Range Index) index summarizes block ranges (minimum/maximum timestamps per range of pages),
