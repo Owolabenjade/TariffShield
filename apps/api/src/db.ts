@@ -212,6 +212,10 @@ export async function migrate(): Promise<void> {
     );
 
     CREATE INDEX IF NOT EXISTS idx_contract_events_importer ON contract_events(importer_id, created_at DESC);
+    -- #227: compound index for kind-filtered event queries (deposit, withdrawal, clawback, etc.)
+    -- The existing idx_contract_events_importer covers queries without a kind filter;
+    -- this index adds kind as the second column for efficient type-specific lookups.
+    CREATE INDEX IF NOT EXISTS idx_contract_events_importer_kind ON contract_events(importer_id, kind, created_at DESC);
 
     ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS ledger_sequence INTEGER;
     ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_index INTEGER;
@@ -925,6 +929,80 @@ export async function revokeOldestSession(userId: string): Promise<void> {
     [userId],
     "revoke_oldest_session",
   );
+}
+
+// ── #231: Audit log helper ──────────────────────────────────────────────────
+
+export async function logAudit(
+  actorUserId: string | null,
+  action: string,
+  targetId: string | null,
+  payload: Record<string, unknown> | null,
+): Promise<void> {
+  await timedQuery(
+    `INSERT INTO audit_log (actor_user_id, action, target_id, payload)
+     VALUES ($1, $2, $3, $4)`,
+    [actorUserId, action, targetId, payload ? JSON.stringify(payload) : null],
+    "insert_audit_log",
+  );
+}
+
+// ── #235: Refresh token helpers ─────────────────────────────────────────────
+
+export async function createRefreshToken(
+  userId: string,
+  tokenHash: string,
+  expiresAt: Date,
+  userAgent?: string,
+  ipAddress?: string,
+): Promise<string> {
+  const result = await timedQuery<{ id: string }>(
+    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, user_agent, ip_address)
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    [userId, tokenHash, expiresAt, userAgent ?? null, ipAddress ?? null],
+    "insert_refresh_token",
+  );
+  return result.rows[0]!.id;
+}
+
+export async function validateRefreshToken(
+  tokenHash: string,
+): Promise<{ id: string; userId: string; expiresAt: Date } | null> {
+  const result = await timedQuery<{ id: string; user_id: string; expires_at: Date }>(
+    `SELECT id, user_id, expires_at FROM refresh_tokens
+     WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()`,
+    [tokenHash],
+    "validate_refresh_token",
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return { id: row.id, userId: row.user_id, expiresAt: row.expires_at };
+}
+
+export async function rotateRefreshToken(
+  oldId: string,
+  newTokenHash: string,
+  newExpiresAt: Date,
+): Promise<string> {
+  const result = await timedQuery<{ user_id: string }>(
+    `UPDATE refresh_tokens SET revoked_at = now() WHERE id = $1 RETURNING user_id`,
+    [oldId],
+    "revoke_refresh_token",
+  );
+  const userId = result.rows[0]?.user_id;
+  if (!userId) throw new Error("refresh token not found");
+
+  return createRefreshToken(userId, newTokenHash, newExpiresAt);
+}
+
+export async function revokeRefreshToken(tokenHash: string): Promise<boolean> {
+  const result = await timedQuery(
+    `UPDATE refresh_tokens SET revoked_at = now()
+     WHERE token_hash = $1 AND revoked_at IS NULL`,
+    [tokenHash],
+    "revoke_refresh_token",
+  );
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function getStaleAccounts(
