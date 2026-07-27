@@ -9,11 +9,37 @@ import {
   getActiveSessionCount,
   revokeOldestSession,
   revokeSession,
+  createRefreshToken,
+  validateRefreshToken,
+  rotateRefreshToken,
+  revokeRefreshToken,
 } from "../db.js";
 import { hashPassword, verifyPassword, signToken, authMiddleware, MAX_SESSIONS, type AuthedRequest } from "../auth.js";
 import { env } from "../config/env.js";
+import { createHash, randomBytes } from "crypto";
 
 export const authRouter = Router();
+
+const ACCESS_TOKEN_EXPIRY = "15m";
+const REFRESH_TOKEN_EXPIRY_DAYS = 30;
+
+function hashToken(raw: string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function generateRefreshTokenPair(userId: string, req: { ip?: string; get?: (h: string) => string | undefined }) {
+  const rawToken = randomBytes(64).toString("hex");
+  const tokenHash = hashToken(rawToken);
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+  const tokenPromise = createRefreshToken(
+    userId,
+    tokenHash,
+    expiresAt,
+    req.get?.("user-agent") ?? undefined,
+    req.ip ?? undefined,
+  );
+  return { rawToken, tokenPromise, expiresAt };
+}
 
 const SignupSchema = z.object({
   email: z.string().email().toLowerCase(),
@@ -83,7 +109,13 @@ authRouter.post("/signup", async (req: Request, res: Response) => {
     }
 
     const sessionId = await createSession(u.id, req.ip ?? undefined, req.get("user-agent") ?? undefined);
-    res.json({ token: signToken({ id: u.id, email: u.email, role: u.role, sessionId }), user: u });
+    const refreshToken = generateRefreshTokenPair(u.id, req);
+    await refreshToken.tokenPromise;
+    res.json({
+      token: signToken({ id: u.id, email: u.email, role: u.role, sessionId }),
+      refreshToken: refreshToken.rawToken,
+      user: u,
+    });
   } catch (err) {
     const e = err as { code?: string };
     if (e.code === "23505") {
@@ -150,9 +182,12 @@ authRouter.post("/login", async (req: Request, res: Response) => {
 
   const sessionId = await createSession(u.id, ipAddress, userAgent);
   const token = signToken({ id: u.id, email: u.email, role: u.role, sessionId });
+  const refreshToken = generateRefreshTokenPair(u.id, req);
+  await refreshToken.tokenPromise;
 
   res.json({
     token,
+    refreshToken: refreshToken.rawToken,
     user: { id: u.id, email: u.email, role: u.role },
   });
 });
@@ -162,7 +197,58 @@ authRouter.post("/logout", authMiddleware, async (req: Request, res: Response) =
   if (sessionId) {
     await revokeSession(sessionId);
   }
+  const tokenHash = req.body?.refreshToken ? hashToken(req.body.refreshToken) : null;
+  if (tokenHash) {
+    await revokeRefreshToken(tokenHash);
+  }
   res.json({ message: "logged out" });
+});
+
+// ── #235: POST /auth/refresh — rotate refresh token and issue new access token ──
+
+const RefreshSchema = z.object({
+  refreshToken: z.string().min(1),
+});
+
+authRouter.post("/refresh", async (req: Request, res: Response) => {
+  const parse = RefreshSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: "invalid input" });
+    return;
+  }
+
+  const tokenHash = hashToken(parse.data.refreshToken);
+  const existing = await validateRefreshToken(tokenHash);
+  if (!existing) {
+    res.status(401).json({ error: "invalid or expired refresh token" });
+    return;
+  }
+
+  const newRefreshToken = randomBytes(64).toString("hex");
+  const newRefreshHash = hashToken(newRefreshToken);
+  const newExpiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+  const newId = await rotateRefreshToken(existing.id, newRefreshHash, newExpiresAt);
+
+  const user = await pool.query<{ email: string; role: string }>(
+    "SELECT email, role FROM users WHERE id = $1",
+    [existing.userId],
+  );
+  if (!user.rowCount) {
+    res.status(401).json({ error: "user not found" });
+    return;
+  }
+
+  const u = user.rows[0]!;
+  const sessionId = await createSession(existing.userId, req.ip ?? undefined, req.get("user-agent") ?? undefined);
+  const accessToken = signToken({
+    id: existing.userId,
+    email: u.email,
+    role: u.role as "importer" | "surety_admin",
+    sessionId,
+  });
+
+  res.json({ token: accessToken, refreshToken: newRefreshToken });
 });
 
 authRouter.get("/me", authMiddleware, (req: Request, res: Response) => {
