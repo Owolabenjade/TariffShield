@@ -2,7 +2,8 @@ import { Router, type Request, type Response } from "express";
 import { createHash } from "crypto";
 import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import { pool, getImporterMetrics } from "../db.js";
+import { pool, getImporterMetrics, refreshImporterMetricsView } from "../db.js";
+import { adminRouter } from "./admin.js";
 import { authMiddleware, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { requireLicenseVerified } from "./surety-license.js";
 import { contractClient, explorerTx, platformKeypair, suretyKeypair } from "../stellar.js";
@@ -177,6 +178,56 @@ async function loadImporterFor(req: Request, importerId: string) {
   ]);
   return r.rows[0] ?? null;
 }
+
+/**
+ * GET /admin/importers/metrics
+ *
+ * Returns all rows from the importer_metrics materialized view.
+ * surety_admin only.
+ */
+adminRouter.get("/importers/metrics", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== "surety_admin") {
+    res.status(403).json({ error: "surety admin only" });
+    return;
+  }
+
+  try {
+    const result = await pool.query("SELECT * FROM importer_metrics ORDER BY legal_name ASC");
+    res.json({ metrics: result.rows });
+  } catch (err) {
+    console.error("[metrics] failed to get admin metrics:", err);
+    res.status(500).json({ error: "failed to retrieve importer metrics" });
+  }
+});
+
+/**
+ * GET /importers/:id/metrics
+ *
+ * Returns the single metrics row for the authenticated importer.
+ */
+importersRouter.get("/:id/metrics", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT * FROM importer_metrics WHERE importer_id = $1",
+      [importer.id]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: "metrics not found for importer" });
+      return;
+    }
+    res.json({ metrics: result.rows[0] });
+  } catch (err) {
+    console.error("[metrics] failed to get importer metrics:", err);
+    res.status(500).json({ error: "failed to retrieve importer metrics" });
+  }
+});
 
 importersRouter.get("/:id", async (req: Request, res: Response) => {
   const importer = await loadImporterFor(req, String(req.params.id ?? ""));
@@ -415,6 +466,9 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
        ON CONFLICT (ledger_sequence, event_index) DO NOTHING`,
       [importer.id, requiredStroops.toString(), onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder],
     );
+
+    // Refresh the importer_metrics materialized view
+    await refreshImporterMetricsView();
 
     res.json({
       annualDutyTotal,

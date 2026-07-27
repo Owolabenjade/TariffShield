@@ -623,6 +623,40 @@ export async function migrate(): Promise<void> {
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_mv_singleton
       ON importer_metrics_mv (singleton_id);
+
+    ALTER TABLE importers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+    CREATE MATERIALIZED VIEW IF NOT EXISTS importer_metrics AS
+    SELECT
+      i.id AS importer_id,
+      i.legal_name,
+      i.stellar_address,
+      COALESCE(t.latest_required_collateral, 0) AS required_collateral,
+      COALESCE(
+        SUM(CASE WHEN ce.kind IN ('deposit', 'deposit_collateral', 'deposit_reserve') THEN ce.amount ELSE 0 END) -
+        SUM(CASE WHEN ce.kind IN ('withdrawal', 'withdraw') THEN ce.amount ELSE 0 END), 0
+      ) AS current_balance,
+      COALESCE(t.latest_annual_duty_total, 0) AS annual_duty_total,
+      CASE WHEN COALESCE(t.latest_required_collateral, 0) > 0
+        THEN ROUND(
+          (SUM(CASE WHEN ce.kind IN ('deposit', 'deposit_collateral', 'deposit_reserve') THEN ce.amount ELSE 0 END) -
+           SUM(CASE WHEN ce.kind IN ('withdrawal', 'withdraw') THEN ce.amount ELSE 0 END))::NUMERIC
+          / t.latest_required_collateral, 4)
+        ELSE NULL END AS coverage_ratio,
+      now() AS refreshed_at
+    FROM importers i
+    LEFT JOIN LATERAL (
+      SELECT annual_duty_total AS latest_annual_duty_total,
+             computed_required_collateral AS latest_required_collateral
+      FROM tariff_uploads WHERE importer_id = i.id ORDER BY created_at DESC LIMIT 1
+    ) t ON true
+    LEFT JOIN contract_events ce ON ce.importer_id = i.id
+    WHERE i.deleted_at IS NULL
+    GROUP BY i.id, i.legal_name, i.stellar_address,
+             t.latest_annual_duty_total, t.latest_required_collateral;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_importer_id
+      ON importer_metrics (importer_id);
   `,
     undefined,
     "migrate_schema",
@@ -689,6 +723,27 @@ export async function refreshImporterMetrics(): Promise<void> {
     "refresh_importer_metrics_mv",
   );
 }
+
+/**
+ * Refresh the importer_metrics materialized view concurrently without blocking reads.
+ * 
+ * Refresh Cadence:
+ * - Triggered on-demand inside the tariff upload POST handler (`/importers/:id/upload-tariff-csv`).
+ * - Can also be run on a background timer or cron (e.g. every 5 minutes) to sync async
+ *   on-chain ledger events (deposits, withdrawals, clawbacks).
+ * 
+ * Staleness Window:
+ * - Near-zero latency for tariff upload mutations since refresh is triggered immediately.
+ * - Up to 5 minutes latency (or since last indexer run) for on-chain events if relying on periodic refresh.
+ */
+export async function refreshImporterMetricsView(): Promise<void> {
+  await timedQuery(
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY importer_metrics",
+    undefined,
+    "refresh_importer_metrics",
+  );
+}
+
 
 export async function getLastProcessedLedger(): Promise<number | null> {
   const result = await timedQuery<{ last_processed_ledger: number }>(
