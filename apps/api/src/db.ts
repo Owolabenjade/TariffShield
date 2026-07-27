@@ -214,6 +214,10 @@ export async function migrate(): Promise<void> {
     );
 
     CREATE INDEX IF NOT EXISTS idx_contract_events_importer ON contract_events(importer_id, created_at DESC);
+    -- #227: compound index for kind-filtered event queries (deposit, withdrawal, clawback, etc.)
+    -- The existing idx_contract_events_importer covers queries without a kind filter;
+    -- this index adds kind as the second column for efficient type-specific lookups.
+    CREATE INDEX IF NOT EXISTS idx_contract_events_importer_kind ON contract_events(importer_id, kind, created_at DESC);
 
     -- #248: B-tree index on contract_events (importer_id, id DESC) to support high-performance cursor-based pagination.
     CREATE INDEX IF NOT EXISTS idx_contract_events_importer_id_pagination ON contract_events(importer_id, id DESC);
@@ -639,6 +643,66 @@ export async function migrate(): Promise<void> {
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_mv_singleton
       ON importer_metrics_mv (singleton_id);
+
+    -- #231: audit_log — append-only immutable action history for SOC 2 compliance
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      target_id TEXT,
+      payload JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_id, created_at DESC);
+
+    -- Prevent UPDATE and DELETE on audit_log via row-level security
+    ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY audit_log_no_update ON audit_log FOR UPDATE USING (false);
+    CREATE POLICY audit_log_no_delete ON audit_log FOR DELETE USING (false);
+
+    -- #232: bonds — full bond lifecycle tracking (supersedes importers.bond_id)
+    -- NOTE: importers.bond_id is deprecated and retained for backward compatibility.
+    -- All new bond queries should use the bonds table instead.
+    CREATE TABLE IF NOT EXISTS bonds (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
+      bond_number BIGINT NOT NULL,
+      policy_type TEXT NOT NULL DEFAULT 'continuous' CHECK (policy_type IN ('continuous', 'single_entry', 'term')),
+      coverage_amount NUMERIC(20, 2) NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending', 'active', 'expired', 'cancelled', 'replaced')),
+      issued_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
+      replaced_by_id UUID REFERENCES bonds(id),
+      stellar_contract_address TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_bonds_bond_number ON bonds(bond_number);
+    CREATE INDEX IF NOT EXISTS idx_bonds_importer_status ON bonds(importer_id, status, created_at DESC);
+
+    -- Migrate existing importers.bond_id values into bonds table
+    INSERT INTO bonds (importer_id, bond_number, policy_type, coverage_amount, status, issued_at, created_at)
+    SELECT id, bond_id, 'continuous', 0, 'active', created_at, created_at
+    FROM importers
+    WHERE NOT EXISTS (SELECT 1 FROM bonds WHERE bond_number = importers.bond_id);
+
+    -- #235: refresh_tokens — JWT refresh token flow with server-side revocation
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ,
+      replaced_by_id UUID REFERENCES refresh_tokens(id),
+      user_agent TEXT,
+      ip_address INET,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
   `,
     undefined,
     'migrate_schema'
@@ -902,6 +966,80 @@ export async function revokeOldestSession(userId: string): Promise<void> {
     [userId],
     'revoke_oldest_session'
   );
+}
+
+// ── #231: Audit log helper ──────────────────────────────────────────────────
+
+export async function logAudit(
+  actorUserId: string | null,
+  action: string,
+  targetId: string | null,
+  payload: Record<string, unknown> | null,
+): Promise<void> {
+  await timedQuery(
+    `INSERT INTO audit_log (actor_user_id, action, target_id, payload)
+     VALUES ($1, $2, $3, $4)`,
+    [actorUserId, action, targetId, payload ? JSON.stringify(payload) : null],
+    "insert_audit_log",
+  );
+}
+
+// ── #235: Refresh token helpers ─────────────────────────────────────────────
+
+export async function createRefreshToken(
+  userId: string,
+  tokenHash: string,
+  expiresAt: Date,
+  userAgent?: string,
+  ipAddress?: string,
+): Promise<string> {
+  const result = await timedQuery<{ id: string }>(
+    `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, user_agent, ip_address)
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    [userId, tokenHash, expiresAt, userAgent ?? null, ipAddress ?? null],
+    "insert_refresh_token",
+  );
+  return result.rows[0]!.id;
+}
+
+export async function validateRefreshToken(
+  tokenHash: string,
+): Promise<{ id: string; userId: string; expiresAt: Date } | null> {
+  const result = await timedQuery<{ id: string; user_id: string; expires_at: Date }>(
+    `SELECT id, user_id, expires_at FROM refresh_tokens
+     WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()`,
+    [tokenHash],
+    "validate_refresh_token",
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return { id: row.id, userId: row.user_id, expiresAt: row.expires_at };
+}
+
+export async function rotateRefreshToken(
+  oldId: string,
+  newTokenHash: string,
+  newExpiresAt: Date,
+): Promise<string> {
+  const result = await timedQuery<{ user_id: string }>(
+    `UPDATE refresh_tokens SET revoked_at = now() WHERE id = $1 RETURNING user_id`,
+    [oldId],
+    "revoke_refresh_token",
+  );
+  const userId = result.rows[0]?.user_id;
+  if (!userId) throw new Error("refresh token not found");
+
+  return createRefreshToken(userId, newTokenHash, newExpiresAt);
+}
+
+export async function revokeRefreshToken(tokenHash: string): Promise<boolean> {
+  const result = await timedQuery(
+    `UPDATE refresh_tokens SET revoked_at = now()
+     WHERE token_hash = $1 AND revoked_at IS NULL`,
+    [tokenHash],
+    "revoke_refresh_token",
+  );
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function getStaleAccounts(

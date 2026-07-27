@@ -141,6 +141,8 @@ importersRouter.post('/', async (req: Request, res: Response) => {
     [importer.id, 'register', onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder]
   );
 
+  await logAudit(user.id, "register", importer.id, { legalName, bondId });
+
   res.json({
     importer: {
       id: importer.id,
@@ -494,6 +496,8 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
       ]
     );
 
+    await logAudit(user.id, "apply_tariff_upload", importer.id, { filename: parse.data.filename, annualDutyTotal, requiredStroops: requiredStroops.toString() });
+
     res.json({
       annualDutyTotal,
       bondFaceValue,
@@ -561,6 +565,7 @@ importersRouter.post('/:id/deposit', async (req: Request, res: Response) => {
       amountStroops: parse.data.amountStroops,
     },
   });
+  await logAudit(user.id, "deposit", importer.id, { bucket: parse.data.bucket, amountStroops: parse.data.amountStroops });
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
@@ -613,6 +618,7 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
       amountStroops: parse.data.amountStroops,
     },
   });
+  await logAudit(user.id, "withdraw", importer.id, { amountStroops: parse.data.amountStroops });
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
@@ -802,4 +808,23 @@ importersRouter.get('/:id/tx-status/:jobId', async (req: Request, res: Response)
   } else {
     res.json({ state, progress });
   }
+});
+
+// ── #232: GET /importers/:id/bonds — full bond history ──────────────────────
+
+importersRouter.get("/:id/bonds", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, bond_number, policy_type, coverage_amount, status,
+            issued_at, expires_at, replaced_by_id, stellar_contract_address, created_at
+       FROM bonds WHERE importer_id = $1 ORDER BY created_at DESC`,
+    [importer.id],
+  );
+
+  res.json({ bonds: r.rows });
 });
