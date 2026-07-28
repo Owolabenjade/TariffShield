@@ -103,6 +103,9 @@ The `traceId` and `spanId` are automatically injected into Pino log records via 
 |---|---|---|---|
 | `db_query_duration_seconds` | Histogram | `query_name` | Query latency distribution |
 | `db_slow_queries_total` | Counter | `threshold` (`500ms` / `2000ms`) | Count of slow queries |
+| `pg_pool_active` | Gauge | — | PostgreSQL pool clients currently checked out |
+| `pg_pool_idle` | Gauge | — | Idle PostgreSQL pool clients available for reuse |
+| `pg_pool_waiting` | Gauge | — | Queued requests waiting for a PostgreSQL pool client |
 
 ### Slow query log fields
 
@@ -120,6 +123,7 @@ Queries taking ≥2000ms emit a Pino `error`.
 
 - **DbSlowQueryRateHigh** — fires when the 500ms slow query rate > 1/s for 3 minutes (warning)
 - **DbCriticalSlowQuery** — fires immediately on any ≥2s query (critical)
+- **PgPoolExhaustion** (issue #760) — fires when more than 5 requests have waited for a pool client for over 10 seconds (warning). Mirrors the in-process log-only check already in `apps/api/src/db.ts`. See monitoring/runbooks/pg-pool-exhaustion.md.
 
 ### Top 10 slowest queries via pg_stat_statements
 
