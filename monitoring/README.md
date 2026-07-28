@@ -121,8 +121,8 @@ Queries taking ≥2000ms emit a Pino `error`.
 
 `monitoring/prometheus/alerts/database.yml` defines:
 
-- **DbSlowQueryRateHigh** — fires when the 500ms slow query rate > 1/s for 3 minutes (warning)
-- **DbCriticalSlowQuery** — fires immediately on any ≥2s query (critical)
+- **DbSlowQueryRateHigh** — fires when the 500ms slow query rate > 1/s for 3 minutes (warning). See monitoring/runbooks/database-slow-queries.md.
+- **DbCriticalSlowQuery** — fires immediately on any ≥2s query (critical). See monitoring/runbooks/database-slow-queries.md.
 - **PgPoolExhaustion** (issue #760) — fires when more than 5 requests have waited for a pool client for over 10 seconds (warning). Mirrors the in-process log-only check already in `apps/api/src/db.ts`. See monitoring/runbooks/pg-pool-exhaustion.md.
 
 ### Top 10 slowest queries via pg_stat_statements
