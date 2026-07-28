@@ -29,13 +29,14 @@
     "verify-upgrade": "tsx scripts/verify-upgrade.ts",
     "rollback-upgrade": "tsx scripts/rollback-upgrade.ts",
     "list-wasm-hashes": "tsx scripts/list-wasm-hashes.ts",
+    "test:scripts": "tsx --test --test-force-exit scripts/__tests__/*.test.ts",
     "changelog": "conventional-changelog -p angular -i CHANGELOG.md -s",
     "generate:types": "openapi-typescript apps/api/openapi.yaml -o packages/api-types/index.ts"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
-    "concurrently": "^9.1.0",
+    "concurrently": "^9.2.4",
     "eslint": "^8.57.0",
     "openapi-typescript": "^7.0.0",
     "@commitlint/cli": "^19.0.0",

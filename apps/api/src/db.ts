@@ -1,62 +1,72 @@
-import { Pool, type QueryResult, type QueryResultRow } from "pg";
-import pino from "pino";
-import client from "prom-client";
-import { env } from "./config/env.js";
+import { Pool, type QueryResult, type QueryResultRow } from 'pg';
+import pino from 'pino';
+import client from 'prom-client';
+import { env } from './config/env.js';
 
-const logger = pino({ name: "db" });
+const logger = pino({ name: 'db' });
 
 const url = new URL(env.DATABASE_URL);
-const sslRequired = url.searchParams.get("sslmode") === "require";
+const sslRequired = url.searchParams.get('sslmode') === 'require';
 
+// Pool sizing (#241): max=20 by default caps concurrent connections well
+// under PostgreSQL's default max_connections=100, leaving headroom for
+// other API instances, migrations, and admin/monitoring connections when
+// running multiple replicas. idleTimeoutMillis recycles idle clients so
+// they don't sit open indefinitely; connectionTimeoutMillis fails fast
+// instead of queuing forever when the pool is saturated; statement_timeout
+// guards against a single runaway query holding a connection (and
+// blocking the pool) indefinitely.
 const basePool = new Pool({
   connectionString: env.DATABASE_URL,
   ssl: sslRequired ? { rejectUnauthorized: false } : undefined,
   max: env.PG_POOL_MAX,
   idleTimeoutMillis: env.PG_IDLE_TIMEOUT_MS,
   connectionTimeoutMillis: env.PG_CONN_TIMEOUT_MS,
+  statement_timeout: env.PG_STATEMENT_TIMEOUT_MS,
+  application_name: 'tariffshield-api',
 });
 
 // ── Pool monitoring (#264) ────────────────────────────────────────────────────
 
 export const pgPoolEventsTotal = new client.Counter({
-  name: "pg_pool_events_total",
-  help: "Total count of PostgreSQL pool lifecycle events",
-  labelNames: ["event"],
+  name: 'pg_pool_events_total',
+  help: 'Total count of PostgreSQL pool lifecycle events',
+  labelNames: ['event'],
 });
 
 // Gauges read the pool's own counters on scrape rather than being tracked by
 // hand — `pool.totalCount`/`idleCount`/`waitingCount` are always the source
 // of truth, so there's no risk of manual increment/decrement drift.
 new client.Gauge({
-  name: "pg_pool_active",
-  help: "Number of PostgreSQL pool clients currently checked out (in use)",
+  name: 'pg_pool_active',
+  help: 'Number of PostgreSQL pool clients currently checked out (in use)',
   collect() {
     this.set(basePool.totalCount - basePool.idleCount);
   },
 });
 
 new client.Gauge({
-  name: "pg_pool_idle",
-  help: "Number of idle PostgreSQL pool clients available for reuse",
+  name: 'pg_pool_idle',
+  help: 'Number of idle PostgreSQL pool clients available for reuse',
   collect() {
     this.set(basePool.idleCount);
   },
 });
 
 new client.Gauge({
-  name: "pg_pool_waiting",
-  help: "Number of queued requests waiting for a PostgreSQL pool client",
+  name: 'pg_pool_waiting',
+  help: 'Number of queued requests waiting for a PostgreSQL pool client',
   collect() {
     this.set(basePool.waitingCount);
   },
 });
 
-basePool.on("connect", () => pgPoolEventsTotal.inc({ event: "connect" }));
-basePool.on("acquire", () => pgPoolEventsTotal.inc({ event: "acquire" }));
-basePool.on("remove", () => pgPoolEventsTotal.inc({ event: "remove" }));
-basePool.on("error", (err) => {
-  pgPoolEventsTotal.inc({ event: "error" });
-  logger.error({ err }, "PostgreSQL pool error (idle client)");
+basePool.on('connect', () => pgPoolEventsTotal.inc({ event: 'connect' }));
+basePool.on('acquire', () => pgPoolEventsTotal.inc({ event: 'acquire' }));
+basePool.on('remove', () => pgPoolEventsTotal.inc({ event: 'remove' }));
+basePool.on('error', (err) => {
+  pgPoolEventsTotal.inc({ event: 'error' });
+  logger.error({ err }, 'PostgreSQL pool error (idle client)');
 });
 
 // Alert when the pool is under sustained exhaustion pressure: waitingCount > 5
@@ -78,7 +88,7 @@ const poolInterval = setInterval(() => {
       waitingAlertFired = true;
       logger.error(
         { waiting, thresholdSeconds: WAITING_ALERT_DURATION_MS / 1000 },
-        `PostgreSQL pool exhaustion: ${waiting} requests waiting for >${WAITING_ALERT_DURATION_MS / 1000}s`,
+        `PostgreSQL pool exhaustion: ${waiting} requests waiting for >${WAITING_ALERT_DURATION_MS / 1000}s`
       );
     }
   } else {
@@ -93,16 +103,16 @@ if (typeof poolInterval.unref === "function") {
 // ── Prometheus metrics (#373) ─────────────────────────────────────────────────
 
 export const dbQueryDurationSeconds = new client.Histogram({
-  name: "db_query_duration_seconds",
-  help: "Duration of PostgreSQL queries in seconds",
-  labelNames: ["query_name"],
+  name: 'db_query_duration_seconds',
+  help: 'Duration of PostgreSQL queries in seconds',
+  labelNames: ['query_name'],
   buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
 });
 
 export const dbSlowQueriesTotal = new client.Counter({
-  name: "db_slow_queries_total",
-  help: "Total number of slow PostgreSQL queries",
-  labelNames: ["threshold"],
+  name: 'db_slow_queries_total',
+  help: 'Total number of slow PostgreSQL queries',
+  labelNames: ['threshold'],
 });
 
 // ── Query timing wrapper ──────────────────────────────────────────────────────
@@ -113,21 +123,23 @@ const SQL_TRUNCATE_LEN = 500;
 
 function sanitizeSql(sql: string): string {
   return sql
-    .replace(/\$\d+/g, "?")
+    .replace(/\$\d+/g, '?')
     .replace(/'[^']*'/g, "'?'")
     .slice(0, SQL_TRUNCATE_LEN);
 }
 
 function inferQueryName(sql: string): string {
   const s = sql.trim().toUpperCase();
-  const m = s.match(/^(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\s+(?:INTO\s+|FROM\s+|TABLE\s+)?(\w+)?/);
-  return m ? `${m[1]!.toLowerCase()}${m[2] ? `_${m[2]!.toLowerCase()}` : ""}` : "unknown";
+  const m = s.match(
+    /^(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\s+(?:INTO\s+|FROM\s+|TABLE\s+)?(\w+)?/
+  );
+  return m ? `${m[1]!.toLowerCase()}${m[2] ? `_${m[2]!.toLowerCase()}` : ''}` : 'unknown';
 }
 
 async function timedQuery<R extends QueryResultRow = QueryResultRow>(
   sql: string,
   values?: unknown[],
-  queryName?: string,
+  queryName?: string
 ): Promise<QueryResult<R>> {
   const start = Date.now();
   const name = queryName ?? inferQueryName(sql);
@@ -139,16 +151,16 @@ async function timedQuery<R extends QueryResultRow = QueryResultRow>(
     endTimer();
 
     if (durationMs >= SLOW_ERROR_MS) {
-      dbSlowQueriesTotal.inc({ threshold: "2000ms" });
+      dbSlowQueriesTotal.inc({ threshold: '2000ms' });
       logger.error(
         { query: sanitizeSql(sql), durationMs, rowCount: result.rowCount, caller: name },
-        "critically slow query",
+        'critically slow query'
       );
     } else if (durationMs >= SLOW_WARN_MS) {
-      dbSlowQueriesTotal.inc({ threshold: "500ms" });
+      dbSlowQueriesTotal.inc({ threshold: '500ms' });
       logger.warn(
         { query: sanitizeSql(sql), durationMs, rowCount: result.rowCount, caller: name },
-        "slow query",
+        'slow query'
       );
     }
 
@@ -164,6 +176,25 @@ export const pool = {
   connect: () => basePool.connect(),
   end: () => basePool.end(),
 };
+
+export interface PoolStats {
+  totalCount: number;
+  idleCount: number;
+  waitingCount: number;
+}
+
+/**
+ * Snapshot of the pool's own connection counters, for the /health/db
+ * endpoint (#241). These are always the source of truth — see the
+ * Prometheus gauges above, which read the same values on scrape.
+ */
+export function getPoolStats(): PoolStats {
+  return {
+    totalCount: basePool.totalCount,
+    idleCount: basePool.idleCount,
+    waitingCount: basePool.waitingCount,
+  };
+}
 
 // ── Schema migrations ─────────────────────────────────────────────────────────
 
@@ -194,6 +225,12 @@ export async function rollback(): Promise<void> {
       user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
       legal_name TEXT NOT NULL,
       ein TEXT,
+      -- #243: SHA-256 hex digest of ein, for PII-safe equality lookups
+      -- (dedup checks, lookup-by-ein) without exposing the plaintext value.
+      -- ein itself is scheduled for encryption (see the ein_encrypted /
+      -- ein_key_version columns below, from the AES-GCM field-encryption
+      -- work) — ein_hash lets lookups keep working once that lands.
+      ein_hash TEXT,
       bond_id BIGINT UNIQUE NOT NULL,
       stellar_address TEXT NOT NULL,
       stellar_secret_encrypted TEXT,
@@ -227,6 +264,20 @@ export async function rollback(): Promise<void> {
     -- The existing idx_contract_events_importer covers queries without a kind filter;
     -- this index adds kind as the second column for efficient type-specific lookups.
     CREATE INDEX IF NOT EXISTS idx_contract_events_importer_kind ON contract_events(importer_id, kind, created_at DESC);
+
+    -- #248: B-tree index on contract_events (importer_id, id DESC) to support high-performance cursor-based pagination.
+    CREATE INDEX IF NOT EXISTS idx_contract_events_importer_id_pagination ON contract_events(importer_id, id DESC);
+
+    -- #245: BRIN index on contract_events.created_at for time-range queries.
+    -- A B-tree index stores pointers for every single row and becomes extremely large at scale.
+    -- A BRIN (Block Range Index) index summarizes block ranges (minimum/maximum timestamps per range of pages),
+    -- resulting in a footprint that is orders of magnitude smaller (typically ~1:800 or 99.8% smaller).
+    -- pages_per_range is set to 32 (down from default 128) to provide finer search granularity,
+    -- which is highly effective for chronologically ordered event logs under high-volume ingestion.
+    -- If contract_events is partitioned by month (Issue #228), parent indexes automatically propagate
+    -- to all child partitions.
+    CREATE INDEX IF NOT EXISTS idx_contract_events_created_at_brin ON contract_events USING BRIN (created_at) WITH (pages_per_range = 32);
+
 
     ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS ledger_sequence INTEGER;
     ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_index INTEGER;
@@ -460,6 +511,19 @@ export async function rollback(): Promise<void> {
     -- EIN is now stored as AES-256-GCM JSON; migrate existing plain text at app layer
     ALTER TABLE importers ADD COLUMN IF NOT EXISTS ein_encrypted TEXT;
     ALTER TABLE importers ADD COLUMN IF NOT EXISTS ein_key_version INTEGER REFERENCES field_encryption_key_versions(key_version);
+
+    -- #243: ein_hash for PII-safe equality lookups (see the importers table
+    -- comment above). Partial unique index — NULL eins (optional field)
+    -- never collide with each other or force uniqueness.
+    ALTER TABLE importers ADD COLUMN IF NOT EXISTS ein_hash TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_importers_ein_hash ON importers(ein_hash) WHERE ein_hash IS NOT NULL;
+
+    -- One-time backfill: compute ein_hash for any pre-existing row that has
+    -- a plaintext ein but no hash yet. Safe to re-run — only touches rows
+    -- still missing ein_hash.
+    UPDATE importers
+      SET ein_hash = encode(sha256(ein::bytea), 'hex')
+      WHERE ein IS NOT NULL AND ein_hash IS NULL;
 
     -- #318: regulatory compliance flags
     CREATE TABLE IF NOT EXISTS compliance_flags (
@@ -700,9 +764,9 @@ export async function rollback(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
   `,
     undefined,
-    "migrate_schema",
+    'migrate_schema'
   );
-  console.log("[migrate] schema ready");
+  console.log('[migrate] schema ready');
 }
 
 // ── importer_metrics_mv (#251) ────────────────────────────────────────────────
@@ -729,14 +793,18 @@ export async function getImporterMetrics(): Promise<ImporterMetrics> {
     compliance_rate: string;
     topup_count_30d: number;
     refreshed_at: Date;
-  }>("SELECT * FROM importer_metrics_mv WHERE singleton_id = 1", undefined, "select_importer_metrics_mv");
+  }>(
+    'SELECT * FROM importer_metrics_mv WHERE singleton_id = 1',
+    undefined,
+    'select_importer_metrics_mv'
+  );
 
   const row = result.rows[0];
   if (!row) {
     return {
       totalImporters: 0,
-      totalBondValue: "0",
-      avgBalance: "0",
+      totalBondValue: '0',
+      avgBalance: '0',
       complianceRate: 100,
       topupCount30d: 0,
       refreshedAt: new Date(0).toISOString(),
@@ -759,9 +827,9 @@ export async function getImporterMetrics(): Promise<ImporterMetrics> {
  */
 export async function refreshImporterMetrics(): Promise<void> {
   await timedQuery(
-    "REFRESH MATERIALIZED VIEW CONCURRENTLY importer_metrics_mv",
+    'REFRESH MATERIALIZED VIEW CONCURRENTLY importer_metrics_mv',
     undefined,
-    "refresh_importer_metrics_mv",
+    'refresh_importer_metrics_mv'
   );
 }
 
@@ -788,9 +856,9 @@ export async function refreshImporterMetricsView(): Promise<void> {
 
 export async function getLastProcessedLedger(): Promise<number | null> {
   const result = await timedQuery<{ last_processed_ledger: number }>(
-    "SELECT last_processed_ledger FROM indexer_state WHERE id = $1",
-    ["default"],
-    "select_indexer_state",
+    'SELECT last_processed_ledger FROM indexer_state WHERE id = $1',
+    ['default'],
+    'select_indexer_state'
   );
   if (!result.rowCount || result.rowCount === 0) {
     return null;
@@ -805,8 +873,8 @@ export async function updateLastProcessedLedger(ledger: number): Promise<void> {
      ON CONFLICT (id) DO UPDATE
      SET last_processed_ledger = EXCLUDED.last_processed_ledger,
          updated_at = now()`,
-    ["default", ledger],
-    "upsert_indexer_state",
+    ['default', ledger],
+    'upsert_indexer_state'
   );
 }
 
@@ -814,15 +882,21 @@ export async function updateLastProcessedLedger(ledger: number): Promise<void> {
  * Pings the database to check if it's alive.
  */
 export async function ping(): Promise<void> {
-  await pool.query("SELECT 1");
+  await pool.query('SELECT 1');
 }
 
 /**
  * Returns all bonds that have been registered on-chain.
  */
-export async function getActiveBonds(): Promise<{ bondId: string; stellarAddress: string; dbBalance: string }[]> {
-  const result = await pool.query<{ bond_id: string; stellar_address: string; collateral_balance: string }>(
-    "SELECT bond_id, stellar_address, collateral_balance FROM importers WHERE registered_on_chain_tx IS NOT NULL"
+export async function getActiveBonds(): Promise<
+  { bondId: string; stellarAddress: string; dbBalance: string }[]
+> {
+  const result = await pool.query<{
+    bond_id: string;
+    stellar_address: string;
+    collateral_balance: string;
+  }>(
+    'SELECT bond_id, stellar_address, collateral_balance FROM importers WHERE registered_on_chain_tx IS NOT NULL'
   );
   return result.rows.map((row) => ({
     bondId: row.bond_id,
@@ -836,54 +910,60 @@ export async function recordAuthenticationAttempt(
   success: boolean,
   userId?: string,
   ipAddress?: string,
-  userAgent?: string,
+  userAgent?: string
 ): Promise<void> {
   await timedQuery(
     `INSERT INTO authentication_attempts (email, success, user_id, ip_address, user_agent)
      VALUES ($1, $2, $3, $4, $5)`,
     [email, success, userId ?? null, ipAddress ?? null, userAgent ?? null],
-    "insert_auth_attempt",
+    'insert_auth_attempt'
   );
 }
 
-export async function getFailedAuthAttempts(email: string, withinMinutes: number = 30): Promise<number> {
+export async function getFailedAuthAttempts(
+  email: string,
+  withinMinutes: number = 30
+): Promise<number> {
   const result = await timedQuery<{ count: string }>(
     `SELECT COUNT(*) as count FROM authentication_attempts
      WHERE email = $1 AND success = FALSE
      AND attempted_at > now() - INTERVAL '${withinMinutes} minutes'`,
     [email],
-    "count_failed_auth_attempts",
+    'count_failed_auth_attempts'
   );
-  return parseInt(result.rows[0]?.count ?? "0", 10);
+  return parseInt(result.rows[0]?.count ?? '0', 10);
 }
 
-export async function lockAccountTemporarily(userId: string, durationMinutes: number = 30): Promise<void> {
+export async function lockAccountTemporarily(
+  userId: string,
+  durationMinutes: number = 30
+): Promise<void> {
   await timedQuery(
     `UPDATE users SET locked_until = now() + INTERVAL '${durationMinutes} minutes'
      WHERE id = $1`,
     [userId],
-    "lock_account",
+    'lock_account'
   );
 }
 
 export async function recordSecurityIncident(
-  severity: "P0" | "P1" | "P2" | "P3",
+  severity: 'P0' | 'P1' | 'P2' | 'P3',
   description: string,
-  affectedScope?: string,
+  affectedScope?: string
 ): Promise<string> {
   const incidentId = `INC-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const result = await timedQuery<{ id: string }>(
     `INSERT INTO security_incidents (incident_id, severity, description, affected_scope)
      VALUES ($1, $2, $3, $4) RETURNING id`,
     [incidentId, severity, description, affectedScope ?? null],
-    "insert_security_incident",
+    'insert_security_incident'
   );
-  return result.rows[0]?.id ?? "";
+  return result.rows[0]?.id ?? '';
 }
 
 export async function createDataErasureRequest(
   userId: string,
-  importerId?: string,
+  importerId?: string
 ): Promise<string> {
   const requestId = `ERASE-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const slaDealine = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -892,9 +972,9 @@ export async function createDataErasureRequest(
      VALUES ($1, $2, $3, $4, ARRAY['legal_name', 'ein', 'email'])
      RETURNING id`,
     [requestId, userId, importerId ?? null, slaDealine],
-    "insert_erasure_request",
+    'insert_erasure_request'
   );
-  return result.rows[0]?.id ?? "";
+  return result.rows[0]?.id ?? '';
 }
 
 // ── SOC 2 CC6 — Session management (#306) ────────────────────────────────────
@@ -904,13 +984,13 @@ const SESSION_INACTIVITY_MINUTES = 15;
 export async function createSession(
   userId: string,
   ipAddress?: string,
-  userAgent?: string,
+  userAgent?: string
 ): Promise<string> {
   const result = await timedQuery<{ id: string }>(
     `INSERT INTO user_sessions (user_id, ip_address, user_agent)
      VALUES ($1, $2, $3) RETURNING id`,
     [userId, ipAddress ?? null, userAgent ?? null],
-    "insert_user_session",
+    'insert_user_session'
   );
   return result.rows[0]!.id;
 }
@@ -922,24 +1002,24 @@ export async function validateSession(sessionId: string): Promise<boolean> {
        AND revoked_at IS NULL
        AND last_activity > now() - INTERVAL '${SESSION_INACTIVITY_MINUTES} minutes'`,
     [sessionId],
-    "validate_user_session",
+    'validate_user_session'
   );
   return (result.rowCount ?? 0) > 0;
 }
 
 export function touchSession(sessionId: string): void {
   timedQuery(
-    "UPDATE user_sessions SET last_activity = now() WHERE id = $1 AND revoked_at IS NULL",
+    'UPDATE user_sessions SET last_activity = now() WHERE id = $1 AND revoked_at IS NULL',
     [sessionId],
-    "touch_user_session",
+    'touch_user_session'
   ).catch(() => {});
 }
 
 export async function revokeSession(sessionId: string): Promise<void> {
   await timedQuery(
-    "UPDATE user_sessions SET revoked_at = now() WHERE id = $1",
+    'UPDATE user_sessions SET revoked_at = now() WHERE id = $1',
     [sessionId],
-    "revoke_user_session",
+    'revoke_user_session'
   );
 }
 
@@ -949,9 +1029,9 @@ export async function getActiveSessionCount(userId: string): Promise<number> {
      WHERE user_id = $1 AND revoked_at IS NULL
        AND last_activity > now() - INTERVAL '${SESSION_INACTIVITY_MINUTES} minutes'`,
     [userId],
-    "count_active_sessions",
+    'count_active_sessions'
   );
-  return parseInt(result.rows[0]?.count ?? "0", 10);
+  return parseInt(result.rows[0]?.count ?? '0', 10);
 }
 
 export async function revokeOldestSession(userId: string): Promise<void> {
@@ -964,7 +1044,7 @@ export async function revokeOldestSession(userId: string): Promise<void> {
        LIMIT 1
      )`,
     [userId],
-    "revoke_oldest_session",
+    'revoke_oldest_session'
   );
 }
 
@@ -1043,7 +1123,7 @@ export async function revokeRefreshToken(tokenHash: string): Promise<boolean> {
 }
 
 export async function getStaleAccounts(
-  days: number,
+  days: number
 ): Promise<Array<{ id: string; email: string; last_login: string | null }>> {
   const result = await timedQuery<{ id: string; email: string; last_login: string | null }>(
     `SELECT u.id, u.email,
@@ -1056,7 +1136,7 @@ export async function getStaleAccounts(
          OR MAX(a.attempted_at) < now() - ($1::integer * INTERVAL '1 day')
       ORDER BY last_login ASC NULLS FIRST`,
     [days],
-    "select_stale_accounts",
+    'select_stale_accounts'
   );
   return result.rows;
 }
