@@ -148,3 +148,12 @@ To reset the statistics:
 ```sql
 SELECT pg_stat_statements_reset();
 ```
+
+## Importer Metrics Refresh (issue #761)
+
+`monitoring/prometheus/alerts/importer-metrics.yml` defines:
+
+- **ImporterMetricsRefreshJobNotRunning** — fires when no `importer_metrics_mv` refresh attempts have run in 15 minutes (critical)
+- **ImporterMetricsRefreshJobFailing** — fires when refresh attempts have been failing for 10 minutes (warning)
+
+See `monitoring/runbooks/importer-metrics-refresh.md` for the response procedure.
