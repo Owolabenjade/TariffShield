@@ -2,7 +2,8 @@ import { Router, type Request, type Response } from "express";
 import { createHash } from "crypto";
 import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import { pool, getImporterMetrics, logAudit } from "../db.js";
+import { pool, getImporterMetrics, logAudit, createNotification } from "../db.js";
+import { NOTIFICATION_KINDS } from "../constants/notification-kinds.js";
 import { authMiddleware, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { requireLicenseVerified } from "./surety-license.js";
 import { contractClient, explorerTx, platformKeypair, suretyKeypair } from "../stellar.js";
@@ -118,6 +119,16 @@ importersRouter.post("/", async (req: Request, res: Response) => {
   );
 
   await logAudit(user.id, "register", importer.id, { legalName, bondId });
+
+  // #230 — best-effort side effect, mirroring the friendbot-funding pattern
+  // above: registration has already succeeded on-chain and in Postgres by
+  // this point, so a notification-insert failure must not turn an otherwise-
+  // successful request into a 500.
+  try {
+    await createNotification(user.id, NOTIFICATION_KINDS.EVENT_RECEIVED, `Importer ${legalName} registered on-chain.`);
+  } catch (err) {
+    console.error("[importers] notification insert failed:", err);
+  }
 
   res.json({
     importer: {
@@ -420,6 +431,21 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
     );
 
     await logAudit(user.id, "apply_tariff_upload", importer.id, { filename: parse.data.filename, annualDutyTotal, requiredStroops: requiredStroops.toString() });
+
+    // #230 — notify the importer who OWNS this account (importer.user_id),
+    // not necessarily req.user: loadImporterFor lets a surety_admin call
+    // this route on any importer's behalf, and the importer is who needs to
+    // know their required collateral changed, not whichever role made the
+    // call. Best-effort, same reasoning as the notification above.
+    try {
+      await createNotification(
+        importer.user_id,
+        NOTIFICATION_KINDS.EVENT_RECEIVED,
+        `Required collateral updated to ${requiredStroops.toString()} stroops following a tariff CSV upload.`,
+      );
+    } catch (err) {
+      console.error("[importers] notification insert failed:", err);
+    }
 
     res.json({
       annualDutyTotal,

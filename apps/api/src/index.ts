@@ -30,6 +30,7 @@ import { startImporterMetricsScheduler } from "./jobs/refresh-importer-metrics.j
 import { suretyLicenseRouter } from "./routes/surety-license.js";
 import { regulatoryRouter } from "./routes/regulatory.js";
 import { healthRouter } from "./routes/health.js";
+import { notificationsRouter } from "./routes/notifications.js";
 
 const app = express();
 
@@ -312,6 +313,7 @@ app.use("/account", privacyRouter);
 app.use("/account", tosRouter);
 app.use("/privacy", privacyRouter);
 app.use("/surety-license", suretyLicenseRouter);
+app.use("/notifications", notificationsRouter);
 app.use("/api/v1/regulatory", regulatoryRouter);
 app.use("/bonds", bondWebhookRouter);   // unauthenticated DocuSign webhook
 app.use("/api", bondSignaturesRouter);  // authenticated bond signature routes

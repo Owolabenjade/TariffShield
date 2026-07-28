@@ -687,6 +687,21 @@ export async function migrate(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
+
+    -- #230: notifications — in-app alerts decoupled from whatever event
+    -- produced them (bond status changes, KYC decisions, tariff spikes,
+    -- contract events). read_at is set once, on first read, and never
+    -- cleared, matching a standard "mark as read" model.
+    CREATE TABLE IF NOT EXISTS notifications (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      message TEXT NOT NULL,
+      read_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, created_at DESC) WHERE read_at IS NULL;
   `,
     undefined,
     "migrate_schema",
@@ -949,6 +964,22 @@ export async function logAudit(
      VALUES ($1, $2, $3, $4)`,
     [actorUserId, action, targetId, payload ? JSON.stringify(payload) : null],
     "insert_audit_log",
+  );
+}
+
+// ── #230: Notification helper ─────────────────────────────────────────────────
+//
+// Shared by any router that needs to raise an in-app notification for a user
+// (routes/notifications.ts doesn't call this itself — it only reads/updates
+// existing rows — but routes that produce the underlying events, like
+// routes/importers.ts, do), mirroring how logAudit above is shared the same
+// way for audit_log.
+export async function createNotification(userId: string, kind: string, message: string): Promise<void> {
+  await timedQuery(
+    `INSERT INTO notifications (user_id, kind, message)
+     VALUES ($1, $2, $3)`,
+    [userId, kind, message],
+    "insert_notification",
   );
 }
 
