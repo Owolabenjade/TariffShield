@@ -687,6 +687,23 @@ export async function migrate(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
+
+    -- #233: alerts — per-importer tariff-spike threshold configuration. Each
+    -- row is a configured threshold; triggered_at/trigger_value are filled in
+    -- by the evaluation that runs after every tariff CSV upload (see
+    -- routes/importers.ts), not at creation time.
+    CREATE TABLE IF NOT EXISTS alerts (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
+      threshold NUMERIC(20, 2) NOT NULL,
+      threshold_type TEXT NOT NULL DEFAULT 'absolute' CHECK (threshold_type IN ('absolute', 'percent_increase')),
+      triggered_at TIMESTAMPTZ,
+      resolved_at TIMESTAMPTZ,
+      trigger_value NUMERIC(20, 2),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_alerts_importer_triggered ON alerts(importer_id, triggered_at DESC);
   `,
     undefined,
     "migrate_schema",
