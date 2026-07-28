@@ -15,7 +15,7 @@ import { pool } from "../apps/api/src/db.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-interface VerificationReport {
+export interface VerificationReport {
   contractId: string;
   wasmHash: string;
   ledgerSequence: number;
@@ -26,7 +26,7 @@ interface VerificationReport {
   overallStatus: "PASS" | "FAIL";
 }
 
-interface AccountVerificationResult {
+export interface AccountVerificationResult {
   stellarAddress: string;
   bondId: string;
   status: "PASS" | "FAIL";
@@ -34,11 +34,69 @@ interface AccountVerificationResult {
   fieldsChanged?: string[];
 }
 
-interface CanaryResult {
+export interface CanaryResult {
   status: "PASS" | "FAIL";
   depositTxHash?: string;
   withdrawTxHash?: string;
   error?: string;
+}
+
+interface OnChainAccount {
+  bondId: { toString(): string };
+  collateralBalance: { toString(): string };
+  requiredCollateral: { toString(): string };
+  reserveBalance: { toString(): string };
+  yieldAccrued: { toString(): string };
+  isClawbacked: boolean;
+}
+
+interface BackupAccount {
+  stellarAddress: string;
+  bondId: string;
+  collateralBalance: string;
+  requiredCollateral: string;
+  reserveBalance: string;
+  yieldAccrued: string;
+  isClawbacked: boolean;
+}
+
+/**
+ * Compares an on-chain account's post-upgrade field values against its
+ * pre-upgrade backup snapshot. Returns the list of field names whose value
+ * changed unexpectedly — an empty array means the account is unchanged.
+ */
+export function diffAccountFields(
+  account: OnChainAccount,
+  backupAccount: BackupAccount | undefined,
+): string[] {
+  const fieldsChanged: string[] = [];
+  if (!backupAccount) return fieldsChanged;
+
+  if (account.bondId.toString() !== backupAccount.bondId) {
+    fieldsChanged.push("bondId");
+  }
+  if (account.collateralBalance.toString() !== backupAccount.collateralBalance) {
+    fieldsChanged.push("collateralBalance");
+  }
+  if (account.requiredCollateral.toString() !== backupAccount.requiredCollateral) {
+    fieldsChanged.push("requiredCollateral");
+  }
+  if (account.reserveBalance.toString() !== backupAccount.reserveBalance) {
+    fieldsChanged.push("reserveBalance");
+  }
+  if (account.yieldAccrued.toString() !== backupAccount.yieldAccrued) {
+    fieldsChanged.push("yieldAccrued");
+  }
+  if (account.isClawbacked !== backupAccount.isClawbacked) {
+    fieldsChanged.push("isClawbacked");
+  }
+
+  return fieldsChanged;
+}
+
+/** A verification run passes only when every account and the canary (if run) passed. */
+export function determineOverallStatus(failedAccounts: number): "PASS" | "FAIL" {
+  return failedAccounts === 0 ? "PASS" : "FAIL";
 }
 
 async function main() {
@@ -125,41 +183,12 @@ async function main() {
       const account = await client.getAccount(stellarAddress);
 
       // Compare with backup if available
-      let fieldsChanged: string[] = [];
-      if (backupData) {
-        const backupAccount = backupData.accounts.find(
-          (a: any) => a.stellarAddress === stellarAddress,
-        );
-
-        if (backupAccount) {
-          if (account.bondId.toString() !== backupAccount.bondId) {
-            fieldsChanged.push("bondId");
-          }
-          if (
-            account.collateralBalance.toString() !==
-            backupAccount.collateralBalance
-          ) {
-            fieldsChanged.push("collateralBalance");
-          }
-          if (
-            account.requiredCollateral.toString() !==
-            backupAccount.requiredCollateral
-          ) {
-            fieldsChanged.push("requiredCollateral");
-          }
-          if (
-            account.reserveBalance.toString() !== backupAccount.reserveBalance
-          ) {
-            fieldsChanged.push("reserveBalance");
-          }
-          if (account.yieldAccrued.toString() !== backupAccount.yieldAccrued) {
-            fieldsChanged.push("yieldAccrued");
-          }
-          if (account.isClawbacked !== backupAccount.isClawbacked) {
-            fieldsChanged.push("isClawbacked");
-          }
-        }
-      }
+      const backupAccount = backupData
+        ? backupData.accounts.find(
+            (a: any) => a.stellarAddress === stellarAddress,
+          )
+        : undefined;
+      const fieldsChanged = diffAccountFields(account, backupAccount);
 
       if (fieldsChanged.length > 0) {
         accountResults.push({
@@ -291,7 +320,7 @@ async function main() {
     totalAccountsVerified: totalImporters,
     accountResults,
     canaryResult,
-    overallStatus: failedAccounts === 0 ? "PASS" : "FAIL",
+    overallStatus: determineOverallStatus(failedAccounts),
   };
 
   // Write report
@@ -358,7 +387,11 @@ async function getContractWasmHash(
   return data.result?.wasmHash ?? "unknown";
 }
 
-main().catch((error) => {
-  console.error("[verify-upgrade] Fatal error:", error);
-  process.exit(1);
-});
+// Only run when invoked directly (tsx scripts/verify-upgrade.ts), not when
+// imported for its exported functions — e.g. by scripts/__tests__/verify-upgrade.test.ts.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => {
+    console.error("[verify-upgrade] Fatal error:", error);
+    process.exit(1);
+  });
+}
