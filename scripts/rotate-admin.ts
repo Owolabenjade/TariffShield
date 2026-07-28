@@ -33,7 +33,7 @@ import {
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-function parseArgs(): { dryRun: boolean; newSecret: string | null } {
+export function parseArgs(): { dryRun: boolean; newSecret: string | null } {
   const args = process.argv.slice(2);
   const dryRun = args.includes("--dry-run");
   const nsIdx = args.indexOf("--new-secret");
@@ -52,7 +52,7 @@ function optional_env(key: string): string | null {
 }
 
 /** Returns the native XLM balance in stroops (1 XLM = 10_000_000 stroops). */
-async function getNativeBalance(
+export async function getNativeBalance(
   server: SorobanRpc.Server,
   publicKey: string,
 ): Promise<bigint> {
@@ -73,7 +73,7 @@ async function getNativeBalance(
 }
 
 /** Call transfer_admin on the contract and return the tx hash or XDR (dry-run). */
-async function rotateAdmin(opts: {
+export async function rotateAdmin(opts: {
   server: SorobanRpc.Server;
   contractId: string;
   networkPassphrase: string;
@@ -156,7 +156,7 @@ async function getOnChainAdmin(
 
 // ─── provider secret update helpers ──────────────────────────────────────────
 
-async function updateRenderSecret(newSecret: string, serviceName: string): Promise<void> {
+export async function updateRenderSecret(newSecret: string, serviceName: string): Promise<void> {
   const apiKey = optional_env("RENDER_API_KEY");
   if (!apiKey) return;
 
@@ -194,7 +194,7 @@ async function updateRenderSecret(newSecret: string, serviceName: string): Promi
   }
 }
 
-async function updateVercelSecret(newSecret: string, projectName: string): Promise<void> {
+export async function updateVercelSecret(newSecret: string, projectName: string): Promise<void> {
   const token = optional_env("VERCEL_TOKEN");
   if (!token) return;
 
@@ -365,7 +365,11 @@ async function main() {
 `);
 }
 
-main().catch((err) => {
-  console.error("\n✗ Rotation failed:", err.message ?? err);
-  process.exit(1);
-});
+// Only run when invoked directly (tsx scripts/rotate-admin.ts), not when
+// imported for its exported functions — e.g. by scripts/__tests__/rotate-admin.test.ts.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    console.error("\n✗ Rotation failed:", err.message ?? err);
+    process.exit(1);
+  });
+}

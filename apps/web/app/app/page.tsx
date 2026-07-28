@@ -22,7 +22,7 @@ import { Nav } from "@/components/Nav";
 import { HealthScore } from "@/components/HealthScore";
 import { DepositWizard } from "@/components/DepositWizard";
 import { BondTimeline } from "@/components/BondTimeline";
-import { api, ApiError, type Importer, type ImporterDetail, stroopsToXlm } from "@/lib/api";
+import { api, ApiError, type Importer, type ImporterDetail, type ContractEvent, stroopsToXlm } from "@/lib/api";
 import { getUser, isAuthenticated } from "@/lib/auth";
 import { useYieldProjection } from "@/lib/workers/useYieldProjection";
 import * as Sentry from "@sentry/nextjs";
@@ -33,6 +33,8 @@ function ImporterDashboard() {
   const [detail, setDetail] = useState<ImporterDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [events, setEvents] = useState<ContractEvent[]>([]);
+  const [refreshCount, setRefreshCount] = useState(0);
 
   const refresh = useCallback(async () => {
     try {
@@ -46,6 +48,8 @@ function ImporterDashboard() {
       setImporter(first);
       const d = await api.getImporter(first.id);
       setDetail(d);
+      setEvents([]);
+      setRefreshCount((prev) => prev + 1);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     }
@@ -184,11 +188,11 @@ function ImporterDashboard() {
 
         {error ? <p className="mt-4 rounded border border-danger bg-danger/10 px-3 py-2 text-sm text-danger">{error}</p> : null}
 
-        <BondTimeline events={detail.events} />
+        <BondTimeline events={events} />
 
         <div className="mt-10">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">On-chain event log</h2>
-          <EventLog importerId={importer.id} />
+          <EventLog key={importer.id + "-" + refreshCount} importerId={importer.id} events={events} setEvents={setEvents} />
         </div>
       </main>
     </>
@@ -345,8 +349,15 @@ function YieldProjectionPanel({ currentBalanceStroops }: { currentBalanceStroops
  * the sentinel div at its bottom) scrolls within 200px of the viewport,
  * deferring this network call and its DOM nodes off the initial page load.
  */
-function EventLog({ importerId }: { importerId: string }) {
-  const [events, setEvents] = useState<ContractEvent[]>([]);
+function EventLog({
+  importerId,
+  events,
+  setEvents,
+}: {
+  importerId: string;
+  events: ContractEvent[];
+  setEvents: React.Dispatch<React.SetStateAction<ContractEvent[]>>;
+}) {
   const [cursor, setCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -360,7 +371,7 @@ function EventLog({ importerId }: { importerId: string }) {
     setError(null);
     try {
       const page = await api.getImporterEventsCursor(importerId, cursor);
-      const fresh = page.events.filter((e) => !seenIds.current.has(e.id));
+      const fresh = page.data.filter((e) => !seenIds.current.has(e.id));
       for (const e of fresh) seenIds.current.add(e.id);
       setEvents((prev) => [...prev, ...fresh]);
       setCursor(page.nextCursor);
@@ -370,7 +381,7 @@ function EventLog({ importerId }: { importerId: string }) {
     } finally {
       setLoading(false);
     }
-  }, [importerId, cursor]);
+  }, [importerId, cursor, setEvents]);
 
   // Fires the *first* page load once the sentinel enters the viewport, and
   // every subsequent page as the user scrolls within 200px of the bottom.
