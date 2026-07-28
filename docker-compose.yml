@@ -18,6 +18,19 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: tariffshield-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - tariffshield-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   api:
     build:
       context: apps/api
@@ -26,10 +39,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - apps/api/.env
     environment:
       DATABASE_URL: postgres://tariffshield:tariffshield_dev_password@postgres:5432/tariffshield
+      REDIS_URL: redis://redis:6379
     ports:
       - "3002:3002"
     networks:

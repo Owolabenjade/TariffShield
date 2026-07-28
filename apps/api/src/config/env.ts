@@ -5,6 +5,10 @@ export const Env = z.object({
   PORT: z.coerce.number().int().positive().default(3002).describe("Port for the API server to listen on"),
   NODE_ENV: z.enum(["development", "production", "test"]).default("development").describe("Application environment"),
   DATABASE_URL: z.string().url().describe("PostgreSQL connection string"),
+  PG_POOL_MAX: z.coerce.number().int().positive().default(10).describe("Max concurrent PostgreSQL connections per API instance (issue #264)"),
+  PG_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(30000).describe("Milliseconds an idle PostgreSQL client is kept before being closed"),
+  PG_CONN_TIMEOUT_MS: z.coerce.number().int().positive().default(3000).describe("Milliseconds to wait for a new PostgreSQL connection before failing fast"),
+  REDIS_URL: z.string().default("redis://localhost:6379").describe("Redis connection string for BullMQ job queue"),
   FRONTEND_ORIGIN: z.string().default("http://localhost:3000").describe("Allowed CORS origin for frontend"),
   JWT_SECRET: z.string().min(32).describe("Secret key for signing JSON Web Tokens"),
 

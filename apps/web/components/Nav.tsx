@@ -8,6 +8,8 @@ import { clearSession, getUser, type AuthUser } from "@/lib/auth";
 export function Nav() {
   const router = useRouter();
   const [user, setUser] = useState<AuthUser | null>(null);
+  const network = (typeof process !== "undefined" && process.env.NEXT_PUBLIC_STELLAR_NETWORK) || "testnet";
+
   useEffect(() => { setUser(getUser()); }, []);
 
   function logout() {
@@ -18,9 +20,14 @@ export function Nav() {
   return (
     <nav className="border-b border-border bg-card">
       <div className="max-w-6xl mx-auto flex items-center justify-between px-6 py-4">
-        <Link href={user ? (user.role === "surety_admin" ? "/surety" : "/app") : "/"} className="text-lg font-semibold tracking-tight text-foreground">
-          <span className="text-accent">▲</span> TariffShield
-        </Link>
+        <div className="flex items-center gap-3">
+          <Link href={user ? (user.role === "surety_admin" ? "/surety" : "/app") : "/"} className="text-lg font-semibold tracking-tight text-foreground">
+            <span className="text-accent">▲</span> TariffShield
+          </Link>
+          <span className={`text-xs font-semibold px-2 py-1 rounded-full ${network === "mainnet" ? "bg-danger/20 text-danger" : "bg-accent/20 text-accent"}`}>
+            {network === "mainnet" ? "🔴 Mainnet" : "🔵 Testnet"}
+          </span>
+        </div>
         <div className="flex items-center gap-4 text-sm">
           {user ? (
             <>

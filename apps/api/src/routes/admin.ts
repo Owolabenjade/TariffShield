@@ -10,6 +10,77 @@ adminRouter.use(authMiddleware);
 adminRouter.use(privacyReacceptanceGate);
 adminRouter.use(tosReacceptanceGate);
 
+// ── #231: GET /admin/audit-log ──────────────────────────────────────────────
+
+const AuditLogQuerySchema = z.object({
+  actor_user_id: z.string().uuid().optional(),
+  action: z.string().optional(),
+  from: z.string().datetime({ offset: true }).optional(),
+  to: z.string().datetime({ offset: true }).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  per_page: z.coerce.number().int().min(1).max(200).default(50),
+});
+
+adminRouter.get("/audit-log", requireRole("surety_admin"), async (req: Request, res: Response) => {
+  const parse = AuditLogQuerySchema.safeParse(req.query);
+  if (!parse.success) {
+    res.status(400).json({ error: "invalid query params", details: parse.error.issues });
+    return;
+  }
+  const { actor_user_id, action, from, to, page, per_page } = parse.data;
+  const offset = (page - 1) * per_page;
+
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  if (actor_user_id) {
+    params.push(actor_user_id);
+    conditions.push(`actor_user_id = $${params.length}`);
+  }
+  if (action) {
+    params.push(action);
+    conditions.push(`action = $${params.length}`);
+  }
+  if (from) {
+    params.push(from);
+    conditions.push(`created_at >= $${params.length}`);
+  }
+  if (to) {
+    params.push(to);
+    conditions.push(`created_at <= $${params.length}`);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const countResult = await pool.query<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM audit_log ${where}`,
+    params,
+  );
+  const total = parseInt(countResult.rows[0]?.count ?? "0", 10);
+
+  params.push(per_page, offset);
+  const dataResult = await pool.query(
+    `SELECT id, actor_user_id, action, target_id, payload, created_at
+       FROM audit_log ${where}
+       ORDER BY created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params,
+  );
+
+  res.json({
+    data: dataResult.rows.map((row) => ({
+      ...row,
+      created_at: (row.created_at as Date).toISOString(),
+    })),
+    pagination: {
+      total,
+      page,
+      per_page,
+      total_pages: Math.ceil(total / per_page),
+    },
+  });
+});
+
 adminRouter.get("/oracle-alerts", async (req: Request, res: Response) => {
   const user = (req as AuthedRequest).user;
   if (user.role !== "surety_admin") {

@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { createHash } from "crypto";
 import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import { pool } from "../db.js";
+import { pool, getImporterMetrics, logAudit } from "../db.js";
 import { authMiddleware, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { requireLicenseVerified } from "./surety-license.js";
 import { contractClient, explorerTx, platformKeypair, suretyKeypair } from "../stellar.js";
@@ -11,6 +11,7 @@ import { validateHtsRates } from "../services/hts-rate-validator.js";
 import { screenImporterEntity, screenWalletAddress } from "../services/aml-screening.js";
 import { validateBondForm301 } from "../services/cbp-bond-validation.js";
 import { env } from "../config/env.js";
+import { enqueueTxSubmit, txSubmitQueue } from "../queue.js";
 
 export const importersRouter = Router();
 importersRouter.use(authMiddleware);
@@ -110,9 +111,13 @@ importersRouter.post("/", async (req: Request, res: Response) => {
     importer.id,
   ]);
   await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, tx_hash) VALUES ($1, $2, $3)",
-    [importer.id, "register", onChain.txHash],
+    `INSERT INTO contract_events (importer_id, kind, tx_hash, ledger_sequence, event_index)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (ledger_sequence, event_index) DO NOTHING`,
+    [importer.id, "register", onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder],
   );
+
+  await logAudit(user.id, "register", importer.id, { legalName, bondId });
 
   res.json({
     importer: {
@@ -148,6 +153,20 @@ importersRouter.get("/", async (req: Request, res: Response) => {
   res.json({ importers: r.rows });
 });
 
+// #251: surety-dashboard aggregate statistics, served from importer_metrics_mv
+// (a materialized view refreshed on a 5-minute schedule — see
+// jobs/refresh-importer-metrics.ts) instead of live GROUP BY queries.
+// Registered before "/:id" so Express doesn't treat "stats" as an :id param.
+importersRouter.get("/stats", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== "surety_admin") {
+    res.status(403).json({ error: "surety admin only" });
+    return;
+  }
+  const metrics = await getImporterMetrics();
+  res.json({ metrics });
+});
+
 async function loadImporterFor(req: Request, importerId: string) {
   const user = (req as AuthedRequest).user;
   if (user.role === "surety_admin") {
@@ -168,10 +187,6 @@ importersRouter.get("/:id", async (req: Request, res: Response) => {
     return;
   }
   const acct = await contractClient.getAccount(importer.stellar_address);
-  const events = await pool.query(
-    "SELECT id, kind, amount, tx_hash, created_at FROM contract_events WHERE importer_id = $1 ORDER BY created_at DESC LIMIT 50",
-    [importer.id],
-  );
   res.json({
     importer: {
       id: importer.id,
@@ -190,15 +205,87 @@ importersRouter.get("/:id", async (req: Request, res: Response) => {
       yieldAccrued: acct.yieldAccrued.toString(),
       isClawbacked: acct.isClawbacked,
     },
-    events: events.rows.map((e) => ({
-      id: e.id,
-      kind: e.kind,
-      amount: e.amount,
-      txHash: e.tx_hash,
-      txUrl: e.tx_hash ? explorerTx(e.tx_hash) : null,
-      createdAt: e.created_at,
-    })),
   });
+});
+
+// #255: cursor-paginated event log, fetched lazily by the dashboard's
+// infinite-scroll event log section instead of being inlined into
+// GET /importers/:id (which used to embed up to 50 events on every load).
+//
+// Cursor is a base64-encoded "<created_at ISO>|<id>" keyset — row-wise
+// comparison on (created_at, id) keeps pagination stable even when many
+// events share the same created_at timestamp.
+function decodeEventsCursor(raw: string): { createdAt: string; id: string } | null {
+  try {
+    const decoded = Buffer.from(raw, "base64").toString("utf8");
+    const sep = decoded.lastIndexOf("|");
+    if (sep === -1) return null;
+    return { createdAt: decoded.slice(0, sep), id: decoded.slice(sep + 1) };
+  } catch {
+    return null;
+  }
+}
+
+function encodeEventsCursor(createdAt: Date, id: string): string {
+  return Buffer.from(`${createdAt.toISOString()}|${id}`, "utf8").toString("base64");
+}
+
+const EventsQuerySchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().positive().max(100).default(20),
+});
+
+importersRouter.get("/:id/events", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  const parse = EventsQuerySchema.safeParse(req.query);
+  if (!parse.success) {
+    res.status(400).json({ error: "invalid query", details: parse.error.issues });
+    return;
+  }
+  const { limit } = parse.data;
+
+  let cursor: { createdAt: string; id: string } | null = null;
+  if (parse.data.cursor) {
+    cursor = decodeEventsCursor(parse.data.cursor);
+    if (!cursor) {
+      res.status(400).json({ error: "invalid cursor" });
+      return;
+    }
+  }
+
+  const rows = cursor
+    ? await pool.query(
+        `SELECT id, kind, amount, tx_hash, created_at FROM contract_events
+         WHERE importer_id = $1 AND (created_at, id) < ($2::timestamptz, $3::uuid)
+         ORDER BY created_at DESC, id DESC LIMIT $4`,
+        [importer.id, cursor.createdAt, cursor.id, limit],
+      )
+    : await pool.query(
+        `SELECT id, kind, amount, tx_hash, created_at FROM contract_events
+         WHERE importer_id = $1
+         ORDER BY created_at DESC, id DESC LIMIT $2`,
+        [importer.id, limit],
+      );
+
+  const events = rows.rows.map((e) => ({
+    id: e.id,
+    kind: e.kind,
+    amount: e.amount,
+    txHash: e.tx_hash,
+    txUrl: e.tx_hash ? explorerTx(e.tx_hash) : null,
+    createdAt: e.created_at,
+  }));
+
+  const last = rows.rows[rows.rows.length - 1];
+  const nextCursor =
+    rows.rows.length === limit && last ? encodeEventsCursor(last.created_at, last.id) : null;
+
+  res.json({ events, nextCursor });
 });
 
 importersRouter.get("/:id/collateral-status", async (req: Request, res: Response) => {
@@ -233,6 +320,7 @@ const TariffUploadSchema = z.object({
 });
 
 importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ""));
   if (!importer) {
     res.status(404).json({ error: "not found" });
@@ -314,7 +402,7 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
 
   try {
     const onChain = await contractClient.setRequiredCollateral(
-      platformKeypair,
+      [platformKeypair],
       importer.stellar_address,
       requiredStroops,
       env.PRICE_ORACLE_CONTRACT_ID,
@@ -325,9 +413,13 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
       [importer.id, parse.data.filename ?? null, annualDutyTotal, requiredStroops.toString(), onChain.txHash],
     );
     await pool.query(
-      "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'required_changed', $2, $3)",
-      [importer.id, requiredStroops.toString(), onChain.txHash],
+      `INSERT INTO contract_events (importer_id, kind, amount, tx_hash, ledger_sequence, event_index)
+       VALUES ($1, 'required_changed', $2, $3, $4, $5)
+       ON CONFLICT (ledger_sequence, event_index) DO NOTHING`,
+      [importer.id, requiredStroops.toString(), onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder],
     );
+
+    await logAudit(user.id, "apply_tariff_upload", importer.id, { filename: parse.data.filename, annualDutyTotal, requiredStroops: requiredStroops.toString() });
 
     res.json({
       annualDutyTotal,
@@ -360,6 +452,7 @@ const DepositSchema = z.object({
 });
 
 importersRouter.post("/:id/deposit", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ""));
   if (!importer) {
     res.status(404).json({ error: "not found" });
@@ -387,20 +480,19 @@ importersRouter.post("/:id/deposit", async (req: Request, res: Response) => {
     return;
   }
 
-  const amount = BigInt(parse.data.amountStroops);
-  const importerKp = Keypair.fromSecret(importer.stellar_secret_encrypted);
-
-  const fn =
-    parse.data.bucket === "collateral"
-      ? contractClient.depositCollateral.bind(contractClient)
-      : contractClient.depositReserve.bind(contractClient);
-
-  const onChain = await fn(importerKp, importer.stellar_address, importer.stellar_address, amount);
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, $2, $3, $4)",
-    [importer.id, parse.data.bucket === "collateral" ? "deposit_collateral" : "deposit_reserve", amount.toString(), onChain.txHash],
-  );
-  res.json({ txHash: onChain.txHash, txUrl: explorerTx(onChain.txHash) });
+  const jobId = await enqueueTxSubmit({
+    method: "deposit",
+    importerId: importer.id,
+    keypairSecret: importer.stellar_secret_encrypted,
+    args: {
+      bucket: parse.data.bucket,
+      importerAddress: importer.stellar_address,
+      sourceAddress: importer.stellar_address,
+      amountStroops: parse.data.amountStroops,
+    },
+  });
+  await logAudit(user.id, "deposit", importer.id, { bucket: parse.data.bucket, amountStroops: parse.data.amountStroops });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 importersRouter.post("/:id/auto-top-up", async (req: Request, res: Response) => {
@@ -409,16 +501,15 @@ importersRouter.post("/:id/auto-top-up", async (req: Request, res: Response) => 
     res.status(404).json({ error: "not found" });
     return;
   }
-  const onChain = await contractClient.autoTopUp(platformKeypair, importer.stellar_address);
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'auto_top_up', $2, $3)",
-    [importer.id, onChain.result.toString(), onChain.txHash],
-  );
-  res.json({
-    movedStroops: onChain.result.toString(),
-    txHash: onChain.txHash,
-    txUrl: explorerTx(onChain.txHash),
+  const jobId = await enqueueTxSubmit({
+    method: "auto_top_up",
+    importerId: importer.id,
+    platformKey: true,
+    args: {
+      importerAddress: importer.stellar_address,
+    },
   });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 const WithdrawSchema = z.object({
@@ -426,6 +517,7 @@ const WithdrawSchema = z.object({
 });
 
 importersRouter.post("/:id/withdraw", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ""));
   if (!importer) {
     res.status(404).json({ error: "not found" });
@@ -443,18 +535,18 @@ importersRouter.post("/:id/withdraw", async (req: Request, res: Response) => {
     return;
   }
 
-  const importerKp = Keypair.fromSecret(importer.stellar_secret_encrypted);
-  const onChain = await contractClient.withdrawCollateral(
-    importerKp,
-    importer.stellar_address,
-    importer.stellar_address,
-    BigInt(parse.data.amountStroops),
-  );
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'withdraw', $2, $3)",
-    [importer.id, parse.data.amountStroops, onChain.txHash],
-  );
-  res.json({ txHash: onChain.txHash, txUrl: explorerTx(onChain.txHash) });
+  const jobId = await enqueueTxSubmit({
+    method: "withdraw",
+    importerId: importer.id,
+    keypairSecret: importer.stellar_secret_encrypted,
+    args: {
+      importerAddress: importer.stellar_address,
+      sourceAddress: importer.stellar_address,
+      amountStroops: parse.data.amountStroops,
+    },
+  });
+  await logAudit(user.id, "withdraw", importer.id, { amountStroops: parse.data.amountStroops });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 // --- Surety admin actions ---
@@ -477,16 +569,16 @@ importersRouter.post("/:id/accrue-yield", requireLicenseVerified, async (req: Re
     res.status(400).json({ error: "invalid input" });
     return;
   }
-  const onChain = await contractClient.accrueYield(
-    platformKeypair,
-    importer.stellar_address,
-    BigInt(parse.data.amountStroops),
-  );
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'yield', $2, $3)",
-    [importer.id, parse.data.amountStroops, onChain.txHash],
-  );
-  res.json({ txHash: onChain.txHash, txUrl: explorerTx(onChain.txHash) });
+  const jobId = await enqueueTxSubmit({
+    method: "accrue_yield",
+    importerId: importer.id,
+    platformKey: true,
+    args: {
+      importerAddress: importer.stellar_address,
+      amountStroops: parse.data.amountStroops,
+    },
+  });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 importersRouter.post("/:id/clawback", requireLicenseVerified, async (req: Request, res: Response) => {
@@ -500,16 +592,15 @@ importersRouter.post("/:id/clawback", requireLicenseVerified, async (req: Reques
     res.status(404).json({ error: "not found" });
     return;
   }
-  const onChain = await contractClient.clawback(suretyKeypair, importer.stellar_address);
-  await pool.query(
-    "INSERT INTO contract_events (importer_id, kind, amount, tx_hash) VALUES ($1, 'clawback', $2, $3)",
-    [importer.id, onChain.result.toString(), onChain.txHash],
-  );
-  res.json({
-    clawedStroops: onChain.result.toString(),
-    txHash: onChain.txHash,
-    txUrl: explorerTx(onChain.txHash),
+  const jobId = await enqueueTxSubmit({
+    method: "clawback",
+    importerId: importer.id,
+    suretyKey: true,
+    args: {
+      importerAddress: importer.stellar_address,
+    },
   });
+  res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
 // ── Issue #335: Oracle data reconciliation endpoint ───────────────────────────
@@ -597,4 +688,50 @@ importersRouter.post("/:id/verify-oracle-data", async (req: Request, res: Respon
     csv_hash: csvHash,
     collateral_timestamp: (upload.created_at as Date).toISOString(),
   });
+});
+
+importersRouter.get("/:id/tx-status/:jobId", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  const job = await txSubmitQueue.getJob(String(req.params.jobId ?? ""));
+  if (!job) {
+    res.status(404).json({ error: "job not found" });
+    return;
+  }
+
+  const state = await job.getState();
+  const progress = job.progress;
+  const result = job.returnvalue;
+  const failedReason = job.failedReason;
+
+  if (state === "completed") {
+    res.json({ state, result });
+  } else if (state === "failed") {
+    res.status(400).json({ state, error: failedReason });
+  } else {
+    res.json({ state, progress });
+  }
+});
+
+// ── #232: GET /importers/:id/bonds — full bond history ──────────────────────
+
+importersRouter.get("/:id/bonds", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, bond_number, policy_type, coverage_amount, status,
+            issued_at, expires_at, replaced_by_id, stellar_contract_address, created_at
+       FROM bonds WHERE importer_id = $1 ORDER BY created_at DESC`,
+    [importer.id],
+  );
+
+  res.json({ bonds: r.rows });
 });

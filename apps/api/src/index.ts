@@ -3,6 +3,7 @@ import "./instrument.js";
 import * as Sentry from "@sentry/node";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { openApiSpec } from "./docs/openapi.js";
+import compression from "compression";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -25,6 +26,7 @@ import { privacyReacceptanceGate } from "./auth.js";
 import { complianceRouter } from "./routes/compliance.js";
 import { kycRouter } from "./routes/kyc.js";
 import { startComplianceReportScheduler } from "./jobs/compliance-report.js";
+import { startImporterMetricsScheduler } from "./jobs/refresh-importer-metrics.js";
 import { suretyLicenseRouter } from "./routes/surety-license.js";
 import { regulatoryRouter } from "./routes/regulatory.js";
 import { healthRouter } from "./routes/health.js";
@@ -219,6 +221,7 @@ app.use(
     crossOriginResourcePolicy: { policy: "cross-origin" },
   }),
 );
+app.use(compression());
 
 const ALLOWED_ORIGINS = (() => {
   const set = new Set<string>(["http://localhost:3000", "http://127.0.0.1:3000"]);
@@ -327,6 +330,7 @@ async function start() {
   await startOracleMonitor();
   await startOracleEventListener();
   startComplianceReportScheduler();
+  startImporterMetricsScheduler();
   app.listen(env.PORT, () => {
     console.log(`[boot] tariffshield API on :${env.PORT}`);
     console.log(`[boot] contract: ${env.TARIFF_SHIELD_CONTRACT_ID}`);

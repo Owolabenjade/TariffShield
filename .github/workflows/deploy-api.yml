@@ -12,9 +12,18 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    env:
+      SERVICE: API
+      ENVIRONMENT: production
+      DEPLOY_URL: https://api.tariffshield.com/health
+      DEPLOYER: ${{ github.actor }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set short SHA
+        run: echo "SHORT_SHA=$(echo '${{ github.event.workflow_run.head_sha }}' | cut -c1-7)" >> "$GITHUB_ENV"
 
       - name: Trigger Render Deploy Hook
         run: |
@@ -23,7 +32,7 @@ jobs:
             exit 1
           fi
           curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
-        
+
       - name: Poll Health Endpoint
         run: |
           echo "Waiting for deployment to propagate..."
@@ -32,4 +41,22 @@ jobs:
           curl -f https://api.tariffshield.com/health || exit 1
 
       - name: Report Deployment Status
-        run: echo "Deployed commit ${{ github.sha }}"
+        run: echo "Deployed commit ${{ github.event.workflow_run.head_sha }}"
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/[email protected]
+        with:
+          webhook: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload-file-path: ./.github/slack/deploy-success.json
+          payload-templated: true
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/[email protected]
+        with:
+          webhook: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload-file-path: ./.github/slack/deploy-failure.json
+          payload-templated: true

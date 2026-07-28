@@ -4,13 +4,14 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Nav } from "@/components/Nav";
-import { api, ApiError, type ImporterDetail, stroopsToXlm } from "@/lib/api";
+import { api, ApiError, type ImporterDetail, type ContractEvent, stroopsToXlm } from "@/lib/api";
 import { getUser, isAuthenticated } from "@/lib/auth";
 
 export default function SuretyImporterDetail() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const [detail, setDetail] = useState<ImporterDetail | null>(null);
+  const [events, setEvents] = useState<ContractEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [yieldXlm, setYieldXlm] = useState("1");
@@ -27,6 +28,10 @@ export default function SuretyImporterDetail() {
     try {
       const d = await api.getImporter(params.id);
       setDetail(d);
+      // #255: events are no longer inlined into getImporter() — fetch the
+      // first page from the cursor-paginated endpoint instead.
+      const page = await api.getImporterEventsCursor(params.id);
+      setEvents(page.events);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     }
@@ -125,11 +130,11 @@ export default function SuretyImporterDetail() {
 
         <div className="mt-10">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">On-chain event log</h2>
-          {detail.events.length === 0 ? (
+          {events.length === 0 ? (
             <p className="mt-3 text-sm text-muted">No events.</p>
           ) : (
             <ul className="mt-3 divide-y divide-border rounded-lg border border-border bg-card overflow-hidden">
-              {detail.events.map((e) => (
+              {events.map((e) => (
                 <li key={e.id} className="px-4 py-3 flex items-center justify-between gap-4">
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium">{e.kind}</p>

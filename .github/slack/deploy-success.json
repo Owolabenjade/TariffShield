@@ -1,0 +1,34 @@
+{
+  "attachments": [
+    {
+      "color": "#2eb886",
+      "blocks": [
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": ":white_check_mark: *${{ env.SERVICE }}* deployed successfully to *${{ env.ENVIRONMENT }}*"
+          }
+        },
+        {
+          "type": "section",
+          "fields": [
+            { "type": "mrkdwn", "text": "*SHA:*\n`${{ env.SHORT_SHA }}`" },
+            { "type": "mrkdwn", "text": "*Deployed by:*\n${{ env.DEPLOYER }}" },
+            { "type": "mrkdwn", "text": "*Link:*\n${{ env.DEPLOY_URL }}" }
+          ]
+        },
+        {
+          "type": "actions",
+          "elements": [
+            {
+              "type": "button",
+              "text": { "type": "plain_text", "text": "View run" },
+              "url": "${{ env.RUN_URL }}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

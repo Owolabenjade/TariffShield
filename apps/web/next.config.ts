@@ -1,12 +1,45 @@
 import { withSentryConfig } from "@sentry/nextjs";
+import withBundleAnalyzerInit from "@next/bundle-analyzer";
 import type { NextConfig } from "next";
+
+const withBundleAnalyzer = withBundleAnalyzerInit({
+  enabled: process.env.ANALYZE === "true",
+});
+
+// CDN URL for static assets (Vercel Edge Network / Cloudflare). Only applied
+// in production — dev must keep serving assets same-origin so paths resolve.
+const cdnUrl = process.env.NEXT_PUBLIC_CDN_URL;
+const assetPrefix =
+  process.env.NODE_ENV === "production" && cdnUrl ? cdnUrl : undefined;
+
+// #260: Web Worker support (lib/workers/yieldWorker.ts, instantiated via
+// `new Worker(new URL("./yieldWorker.ts", import.meta.url))`) works with
+// Next.js's default webpack 5 build out of the box — no additional
+// `config.output`/loader configuration is required for the module-worker
+// pattern used here. Noted explicitly rather than adding unused webpack
+// options just to have something under a "worker config" heading.
 const config: NextConfig = {
   reactStrictMode: true,
+  assetPrefix,
   env: {
     NEXT_PUBLIC_STELLAR_NETWORK: process.env.NEXT_PUBLIC_STELLAR_NETWORK,
   },
+  async headers() {
+    return [
+      {
+        source: "/_next/static/:path*",
+        headers: [
+          { key: "Cache-Control", value: "public, max-age=31536000, immutable" },
+        ],
+      },
+      {
+        source: "/_next/data/:path*",
+        headers: [{ key: "Cache-Control", value: "no-cache" }],
+      },
+    ];
+  },
 };
-export default withSentryConfig(config, {
+export default withSentryConfig(withBundleAnalyzer(config), {
   // For all available options, see:
   // https://www.npmjs.com/package/@sentry/webpack-plugin#options
 

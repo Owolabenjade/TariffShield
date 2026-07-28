@@ -56,4 +56,4 @@ This will create `docs/dep-graph.svg`.
 
 ## Circular Dependency Detection
 
-The `dep-graph.ts` script automatically detects circular dependencies and exits with a non-zero status code if any are found, preventing them from being introduced.
+The `dep-graph.ts` script automatically detects circular dependencies and exits with a non-zero status code if any are found, preventing them from being introduced into the monorepo.

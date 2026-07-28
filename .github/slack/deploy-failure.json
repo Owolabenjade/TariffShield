@@ -1,0 +1,33 @@
+{
+  "attachments": [
+    {
+      "color": "#e01e5a",
+      "blocks": [
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": "<!here> :x: *${{ env.SERVICE }}* deploy to *${{ env.ENVIRONMENT }}* failed"
+          }
+        },
+        {
+          "type": "section",
+          "fields": [
+            { "type": "mrkdwn", "text": "*SHA:*\n`${{ env.SHORT_SHA }}`" },
+            { "type": "mrkdwn", "text": "*Triggered by:*\n${{ env.DEPLOYER }}" }
+          ]
+        },
+        {
+          "type": "actions",
+          "elements": [
+            {
+              "type": "button",
+              "text": { "type": "plain_text", "text": "View failed run" },
+              "url": "${{ env.RUN_URL }}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
