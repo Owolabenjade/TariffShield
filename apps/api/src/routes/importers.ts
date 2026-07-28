@@ -1,27 +1,18 @@
-import { Router, type Request, type Response } from 'express';
-import { createHash } from 'crypto';
-import { Keypair } from '@stellar/stellar-sdk';
-import { z } from 'zod';
-import { pool, getImporterMetrics } from '../db.js';
-import {
-  authMiddleware,
-  privacyReacceptanceGate,
-  tosReacceptanceGate,
-  type AuthedRequest,
-} from '../auth.js';
-import { requireLicenseVerified } from './surety-license.js';
-import {
-  contractClient,
-  explorerTx,
-  platformKeypair,
-  getRequiredCollateralOnChain,
-} from '../stellar.js';
-import { lookupCbpDutyRate } from '../services/cbp-duty-lookup.js';
-import { validateHtsRates } from '../services/hts-rate-validator.js';
-import { screenImporterEntity, screenWalletAddress } from '../services/aml-screening.js';
-import { validateBondForm301 } from '../services/cbp-bond-validation.js';
-import { env } from '../config/env.js';
-import { enqueueTxSubmit, txSubmitQueue } from '../queue.js';
+import { Router, type Request, type Response } from "express";
+import { createHash } from "crypto";
+import { Keypair } from "@stellar/stellar-sdk";
+import { z } from "zod";
+import { pool, getImporterMetrics, refreshImporterMetricsView } from "../db.js";
+import { adminRouter } from "./admin.js";
+import { authMiddleware, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
+import { requireLicenseVerified } from "./surety-license.js";
+import { contractClient, explorerTx, platformKeypair, suretyKeypair } from "../stellar.js";
+import { lookupCbpDutyRate } from "../services/cbp-duty-lookup.js";
+import { validateHtsRates } from "../services/hts-rate-validator.js";
+import { screenImporterEntity, screenWalletAddress } from "../services/aml-screening.js";
+import { validateBondForm301 } from "../services/cbp-bond-validation.js";
+import { env } from "../config/env.js";
+import { enqueueTxSubmit, txSubmitQueue } from "../queue.js";
 
 export const importersRouter = Router();
 importersRouter.use(authMiddleware);
@@ -280,8 +271,58 @@ async function loadImporterFor(req: Request, importerId: string) {
   return r.rows[0] ?? null;
 }
 
-importersRouter.get('/:id', async (req: Request, res: Response) => {
-  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+/**
+ * GET /admin/importers/metrics
+ *
+ * Returns all rows from the importer_metrics materialized view.
+ * surety_admin only.
+ */
+adminRouter.get("/importers/metrics", async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== "surety_admin") {
+    res.status(403).json({ error: "surety admin only" });
+    return;
+  }
+
+  try {
+    const result = await pool.query("SELECT * FROM importer_metrics ORDER BY legal_name ASC");
+    res.json({ metrics: result.rows });
+  } catch (err) {
+    console.error("[metrics] failed to get admin metrics:", err);
+    res.status(500).json({ error: "failed to retrieve importer metrics" });
+  }
+});
+
+/**
+ * GET /importers/:id/metrics
+ *
+ * Returns the single metrics row for the authenticated importer.
+ */
+importersRouter.get("/:id/metrics", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  if (!importer) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT * FROM importer_metrics WHERE importer_id = $1",
+      [importer.id]
+    );
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: "metrics not found for importer" });
+      return;
+    }
+    res.json({ metrics: result.rows[0] });
+  } catch (err) {
+    console.error("[metrics] failed to get importer metrics:", err);
+    res.status(500).json({ error: "failed to retrieve importer metrics" });
+  }
+});
+
+importersRouter.get("/:id", async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
   if (!importer) {
     res.status(404).json({ error: 'not found' });
     return;
@@ -500,7 +541,8 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
       ]
     );
 
-    await logAudit(user.id, "apply_tariff_upload", importer.id, { filename: parse.data.filename, annualDutyTotal, requiredStroops: requiredStroops.toString() });
+    // Refresh the importer_metrics materialized view
+    await refreshImporterMetricsView();
 
     res.json({
       annualDutyTotal,

@@ -79,7 +79,7 @@ const POOL_CHECK_INTERVAL_MS = 1_000;
 let waitingBreachSince: number | null = null;
 let waitingAlertFired = false;
 
-setInterval(() => {
+const poolInterval = setInterval(() => {
   const waiting = basePool.waitingCount;
   if (waiting > WAITING_ALERT_THRESHOLD) {
     if (waitingBreachSince === null) {
@@ -96,6 +96,9 @@ setInterval(() => {
     waitingAlertFired = false;
   }
 }, POOL_CHECK_INTERVAL_MS);
+if (typeof poolInterval.unref === "function") {
+  poolInterval.unref();
+}
 
 // ── Prometheus metrics (#373) ─────────────────────────────────────────────────
 
@@ -170,6 +173,7 @@ async function timedQuery<R extends QueryResultRow = QueryResultRow>(
 
 export const pool = {
   query: timedQuery,
+  connect: () => basePool.connect(),
   end: () => basePool.end(),
 };
 
@@ -195,6 +199,13 @@ export function getPoolStats(): PoolStats {
 // ── Schema migrations ─────────────────────────────────────────────────────────
 
 export async function migrate(): Promise<void> {
+  const { runMigrations } = await import("./migrations/runner.js");
+  await runMigrations("up");
+}
+
+export async function rollback(): Promise<void> {
+  const { runMigrations } = await import("./migrations/runner.js");
+  await runMigrations("rollback");
   await timedQuery(
     `
     CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -821,6 +832,27 @@ export async function refreshImporterMetrics(): Promise<void> {
     'refresh_importer_metrics_mv'
   );
 }
+
+/**
+ * Refresh the importer_metrics materialized view concurrently without blocking reads.
+ * 
+ * Refresh Cadence:
+ * - Triggered on-demand inside the tariff upload POST handler (`/importers/:id/upload-tariff-csv`).
+ * - Can also be run on a background timer or cron (e.g. every 5 minutes) to sync async
+ *   on-chain ledger events (deposits, withdrawals, clawbacks).
+ * 
+ * Staleness Window:
+ * - Near-zero latency for tariff upload mutations since refresh is triggered immediately.
+ * - Up to 5 minutes latency (or since last indexer run) for on-chain events if relying on periodic refresh.
+ */
+export async function refreshImporterMetricsView(): Promise<void> {
+  await timedQuery(
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY importer_metrics",
+    undefined,
+    "refresh_importer_metrics",
+  );
+}
+
 
 export async function getLastProcessedLedger(): Promise<number | null> {
   const result = await timedQuery<{ last_processed_ledger: number }>(
