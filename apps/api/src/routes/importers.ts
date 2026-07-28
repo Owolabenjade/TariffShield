@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { createHash } from 'crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import { z } from 'zod';
-import { pool, getImporterMetrics } from '../db.js';
+import { pool, getImporterMetrics, logAudit } from '../db.js';
 import {
   authMiddleware,
   privacyReacceptanceGate,
@@ -93,7 +93,16 @@ importersRouter.post('/', async (req: Request, res: Response) => {
     `INSERT INTO importers (user_id, legal_name, ein, ein_hash, bond_id, stellar_address, stellar_secret_encrypted, business_state)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id, legal_name, ein, bond_id, stellar_address, created_at`,
-    [user.id, legalName, ein ?? null, einHash, bondId, kp.publicKey(), kp.secret(), businessState ?? 'CA']
+    [
+      user.id,
+      legalName,
+      ein ?? null,
+      einHash,
+      bondId,
+      kp.publicKey(),
+      kp.secret(),
+      businessState ?? 'CA',
+    ]
   );
   const importer = inserted.rows[0]!;
 
@@ -145,7 +154,7 @@ importersRouter.post('/', async (req: Request, res: Response) => {
     [importer.id, 'register', onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder]
   );
 
-  await logAudit(user.id, "register", importer.id, { legalName, bondId });
+  await logAudit(user.id, 'register', importer.id, { legalName, bondId });
 
   res.json({
     importer: {
@@ -353,8 +362,7 @@ importersRouter.get('/:id/events', async (req: Request, res: Response) => {
   }));
 
   const last = rows.rows[rows.rows.length - 1];
-  const nextCursor =
-    rows.rows.length === limit && last ? last.id : null;
+  const nextCursor = rows.rows.length === limit && last ? last.id : null;
 
   res.json({ data: events, nextCursor });
 });
@@ -390,6 +398,7 @@ const TariffUploadSchema = z.object({
 });
 
 importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
     res.status(404).json({ error: 'not found' });
@@ -500,7 +509,11 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
       ]
     );
 
-    await logAudit(user.id, "apply_tariff_upload", importer.id, { filename: parse.data.filename, annualDutyTotal, requiredStroops: requiredStroops.toString() });
+    await logAudit(user.id, 'apply_tariff_upload', importer.id, {
+      filename: parse.data.filename,
+      annualDutyTotal,
+      requiredStroops: requiredStroops.toString(),
+    });
 
     res.json({
       annualDutyTotal,
@@ -531,6 +544,7 @@ const DepositSchema = z.object({
 });
 
 importersRouter.post('/:id/deposit', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
     res.status(404).json({ error: 'not found' });
@@ -569,7 +583,10 @@ importersRouter.post('/:id/deposit', async (req: Request, res: Response) => {
       amountStroops: parse.data.amountStroops,
     },
   });
-  await logAudit(user.id, "deposit", importer.id, { bucket: parse.data.bucket, amountStroops: parse.data.amountStroops });
+  await logAudit(user.id, 'deposit', importer.id, {
+    bucket: parse.data.bucket,
+    amountStroops: parse.data.amountStroops,
+  });
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
@@ -595,6 +612,7 @@ const WithdrawSchema = z.object({
 });
 
 importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
     res.status(404).json({ error: 'not found' });
@@ -622,7 +640,7 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
       amountStroops: parse.data.amountStroops,
     },
   });
-  await logAudit(user.id, "withdraw", importer.id, { amountStroops: parse.data.amountStroops });
+  await logAudit(user.id, 'withdraw', importer.id, { amountStroops: parse.data.amountStroops });
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
@@ -816,10 +834,10 @@ importersRouter.get('/:id/tx-status/:jobId', async (req: Request, res: Response)
 
 // ── #232: GET /importers/:id/bonds — full bond history ──────────────────────
 
-importersRouter.get("/:id/bonds", async (req: Request, res: Response) => {
-  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+importersRouter.get('/:id/bonds', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
-    res.status(404).json({ error: "not found" });
+    res.status(404).json({ error: 'not found' });
     return;
   }
 
@@ -827,7 +845,7 @@ importersRouter.get("/:id/bonds", async (req: Request, res: Response) => {
     `SELECT id, bond_number, policy_type, coverage_amount, status,
             issued_at, expires_at, replaced_by_id, stellar_contract_address, created_at
        FROM bonds WHERE importer_id = $1 ORDER BY created_at DESC`,
-    [importer.id],
+    [importer.id]
   );
 
   res.json({ bonds: r.rows });
@@ -845,7 +863,13 @@ importersRouter.get("/:id/bonds", async (req: Request, res: Response) => {
 // other document flows already do. See implementation.md for the full
 // rationale.
 
-const DOCUMENT_KINDS = ["cbp_301", "power_of_attorney", "commercial_invoice", "kyc_id", "other"] as const;
+const DOCUMENT_KINDS = [
+  'cbp_301',
+  'power_of_attorney',
+  'commercial_invoice',
+  'kyc_id',
+  'other',
+] as const;
 
 // Stub: in production, use AWS SDK PutObjectCommand to S3_DOCUMENTS_BUCKET.
 // Returns the object-storage key, which is what's persisted in documents.url.
@@ -853,7 +877,7 @@ async function uploadBondDocumentToStorage(
   importerId: string,
   kind: string,
   filename: string,
-  _fileBuffer: Buffer,
+  _fileBuffer: Buffer
 ): Promise<string> {
   const timestamp = Date.now();
   const key = `documents/${importerId}/${kind}/${timestamp}-${filename}`;
@@ -891,11 +915,11 @@ const UploadDocumentSchema = z.object({
 });
 
 // POST /importers/:id/documents — upload a bond application document
-importersRouter.post("/:id/documents", async (req: Request, res: Response) => {
+importersRouter.post('/:id/documents', async (req: Request, res: Response) => {
   const user = (req as AuthedRequest).user;
-  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
-    res.status(404).json({ error: "not found" });
+    res.status(404).json({ error: 'not found' });
     return;
   }
 
@@ -904,11 +928,11 @@ importersRouter.post("/:id/documents", async (req: Request, res: Response) => {
   // instead of surfacing as a raw Postgres constraint-violation error.
   const parse = UploadDocumentSchema.safeParse(req.body);
   if (!parse.success) {
-    res.status(400).json({ error: "invalid input", details: parse.error.issues });
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
     return;
   }
   const { kind, filename, fileBase64, mimeType, expiresAt } = parse.data;
-  const fileBuffer = Buffer.from(fileBase64, "base64");
+  const fileBuffer = Buffer.from(fileBase64, 'base64');
 
   const storageKey = await uploadBondDocumentToStorage(importer.id, kind, filename, fileBuffer);
 
@@ -916,20 +940,33 @@ importersRouter.post("/:id/documents", async (req: Request, res: Response) => {
     `INSERT INTO documents (importer_id, kind, filename, url, mime_type, size_bytes, uploaded_by, expires_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id, kind, filename, mime_type, size_bytes, expires_at, created_at`,
-    [importer.id, kind, filename, storageKey, mimeType ?? null, fileBuffer.length, user.id, expiresAt ?? null],
+    [
+      importer.id,
+      kind,
+      filename,
+      storageKey,
+      mimeType ?? null,
+      fileBuffer.length,
+      user.id,
+      expiresAt ?? null,
+    ]
   );
   const document = inserted.rows[0]!;
 
-  await logAudit(user.id, "document_upload", importer.id, { documentId: document.id, kind, filename });
+  await logAudit(user.id, 'document_upload', importer.id, {
+    documentId: document.id,
+    kind,
+    filename,
+  });
 
   res.status(201).json({ document });
 });
 
 // GET /importers/:id/documents — list documents with signed download URLs
-importersRouter.get("/:id/documents", async (req: Request, res: Response) => {
-  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+importersRouter.get('/:id/documents', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
-    res.status(404).json({ error: "not found" });
+    res.status(404).json({ error: 'not found' });
     return;
   }
 
@@ -942,7 +979,7 @@ importersRouter.get("/:id/documents", async (req: Request, res: Response) => {
   const r = await pool.query(
     `SELECT id, kind, filename, url, mime_type, size_bytes, expires_at, created_at
        FROM documents WHERE importer_id = $1 ORDER BY created_at DESC`,
-    [importer.id],
+    [importer.id]
   );
 
   const documents = r.rows.map((d) => ({
@@ -961,32 +998,36 @@ importersRouter.get("/:id/documents", async (req: Request, res: Response) => {
 });
 
 // DELETE /importers/:id/documents/:docId — surety_admin only
-importersRouter.delete("/:id/documents/:docId", async (req: Request, res: Response) => {
+importersRouter.delete('/:id/documents/:docId', async (req: Request, res: Response) => {
   const user = (req as AuthedRequest).user;
-  if (user.role !== "surety_admin") {
-    res.status(403).json({ error: "surety admin only" });
+  if (user.role !== 'surety_admin') {
+    res.status(403).json({ error: 'surety admin only' });
     return;
   }
-  const importer = await loadImporterFor(req, String(req.params.id ?? ""));
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
-    res.status(404).json({ error: "not found" });
+    res.status(404).json({ error: 'not found' });
     return;
   }
 
   const existing = await pool.query(
-    "SELECT id, kind, filename, url FROM documents WHERE id = $1 AND importer_id = $2",
-    [req.params.docId, importer.id],
+    'SELECT id, kind, filename, url FROM documents WHERE id = $1 AND importer_id = $2',
+    [req.params.docId, importer.id]
   );
   const doc = existing.rows[0];
   if (!doc) {
-    res.status(404).json({ error: "document not found" });
+    res.status(404).json({ error: 'document not found' });
     return;
   }
 
   await deleteBondDocumentFromStorage(doc.url);
-  await pool.query("DELETE FROM documents WHERE id = $1", [doc.id]);
+  await pool.query('DELETE FROM documents WHERE id = $1', [doc.id]);
 
-  await logAudit(user.id, "document_delete", importer.id, { documentId: doc.id, kind: doc.kind, filename: doc.filename });
+  await logAudit(user.id, 'document_delete', importer.id, {
+    documentId: doc.id,
+    kind: doc.kind,
+    filename: doc.filename,
+  });
 
   res.json({ success: true });
 });
