@@ -157,3 +157,21 @@ SELECT pg_stat_statements_reset();
 - **ImporterMetricsRefreshJobFailing** — fires when refresh attempts have been failing for 10 minutes (warning)
 
 See `monitoring/runbooks/importer-metrics-refresh.md` for the response procedure.
+
+---
+
+## HTTP Request Metrics (issue #758, #759)
+
+### Prometheus metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `http_requests_total` | Counter | `method`, `route`, `status_code` | Total HTTP requests processed |
+| `http_request_duration_seconds` | Histogram | `method`, `route`, `status_code` | HTTP request latency distribution |
+
+### Alert rules
+
+`monitoring/prometheus/alerts/http.yml` defines:
+
+- **HttpServerErrorRateHigh** — fires when the HTTP 5xx rate exceeds 0.05/s for 5 minutes (warning). See monitoring/runbooks/http-errors.md.
+- **HttpRequestLatencyHighP95** — fires when p95 request latency exceeds 1s for 5 minutes (warning). See monitoring/runbooks/http-latency.md.
