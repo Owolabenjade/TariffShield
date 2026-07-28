@@ -85,11 +85,15 @@ importersRouter.post('/', async (req: Request, res: Response) => {
     return;
   }
 
+  // #243: store a SHA-256 hash alongside the plaintext ein so future
+  // lookups (dedup checks, lookup-by-ein) never need the raw value.
+  const einHash = ein ? createHash('sha256').update(ein).digest('hex') : null;
+
   const inserted = await pool.query(
-    `INSERT INTO importers (user_id, legal_name, ein, bond_id, stellar_address, stellar_secret_encrypted, business_state)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO importers (user_id, legal_name, ein, ein_hash, bond_id, stellar_address, stellar_secret_encrypted, business_state)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id, legal_name, ein, bond_id, stellar_address, created_at`,
-    [user.id, legalName, ein ?? null, bondId, kp.publicKey(), kp.secret(), businessState ?? 'CA']
+    [user.id, legalName, ein ?? null, einHash, bondId, kp.publicKey(), kp.secret(), businessState ?? 'CA']
   );
   const importer = inserted.rows[0]!;
 

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { ping } from "../db.js";
+import { ping, getPoolStats } from "../db.js";
 import { pingRpc } from "../stellar.js";
 import { pingRedis } from "../queue.js";
 import { env, isProduction } from "../config/env.js";
@@ -57,6 +57,23 @@ healthRouter.get("/", async (_req, res) => {
       contractId: env.TARIFF_SHIELD_CONTRACT_ID,
       network: env.STELLAR_NETWORK,
       env: isProduction ? "production" : "development",
+    });
+  }
+});
+
+// #241 — dedicated DB health check with pool stats, for monitoring
+// connection saturation independently of the aggregate /health checks above.
+healthRouter.get("/db", async (_req, res) => {
+  try {
+    await ping();
+    res.json({
+      status: "ok",
+      pool: getPoolStats(),
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: "failed",
+      pool: getPoolStats(),
     });
   }
 });
