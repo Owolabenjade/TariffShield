@@ -53,7 +53,7 @@ export interface ImporterDetail {
 }
 
 export interface EventsPage {
-  events: ContractEvent[];
+  data: ContractEvent[];
   nextCursor: string | null;
 }
 
