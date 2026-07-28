@@ -703,65 +703,39 @@ export async function rollback(): Promise<void> {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_mv_singleton
       ON importer_metrics_mv (singleton_id);
 
-    -- #231: audit_log — append-only immutable action history for SOC 2 compliance
-    CREATE TABLE IF NOT EXISTS audit_log (
-      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      action TEXT NOT NULL,
-      target_id TEXT,
-      payload JSONB,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    ALTER TABLE importers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
-    CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_user_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_id, created_at DESC);
+    CREATE MATERIALIZED VIEW IF NOT EXISTS importer_metrics AS
+    SELECT
+      i.id AS importer_id,
+      i.legal_name,
+      i.stellar_address,
+      COALESCE(t.latest_required_collateral, 0) AS required_collateral,
+      COALESCE(
+        SUM(CASE WHEN ce.kind IN ('deposit', 'deposit_collateral', 'deposit_reserve') THEN ce.amount ELSE 0 END) -
+        SUM(CASE WHEN ce.kind IN ('withdrawal', 'withdraw') THEN ce.amount ELSE 0 END), 0
+      ) AS current_balance,
+      COALESCE(t.latest_annual_duty_total, 0) AS annual_duty_total,
+      CASE WHEN COALESCE(t.latest_required_collateral, 0) > 0
+        THEN ROUND(
+          (SUM(CASE WHEN ce.kind IN ('deposit', 'deposit_collateral', 'deposit_reserve') THEN ce.amount ELSE 0 END) -
+           SUM(CASE WHEN ce.kind IN ('withdrawal', 'withdraw') THEN ce.amount ELSE 0 END))::NUMERIC
+          / t.latest_required_collateral, 4)
+        ELSE NULL END AS coverage_ratio,
+      now() AS refreshed_at
+    FROM importers i
+    LEFT JOIN LATERAL (
+      SELECT annual_duty_total AS latest_annual_duty_total,
+             computed_required_collateral AS latest_required_collateral
+      FROM tariff_uploads WHERE importer_id = i.id ORDER BY created_at DESC LIMIT 1
+    ) t ON true
+    LEFT JOIN contract_events ce ON ce.importer_id = i.id
+    WHERE i.deleted_at IS NULL
+    GROUP BY i.id, i.legal_name, i.stellar_address,
+             t.latest_annual_duty_total, t.latest_required_collateral;
 
-    -- Prevent UPDATE and DELETE on audit_log via row-level security
-    ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
-    CREATE POLICY audit_log_no_update ON audit_log FOR UPDATE USING (false);
-    CREATE POLICY audit_log_no_delete ON audit_log FOR DELETE USING (false);
-
-    -- #232: bonds — full bond lifecycle tracking (supersedes importers.bond_id)
-    -- NOTE: importers.bond_id is deprecated and retained for backward compatibility.
-    -- All new bond queries should use the bonds table instead.
-    CREATE TABLE IF NOT EXISTS bonds (
-      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
-      bond_number BIGINT NOT NULL,
-      policy_type TEXT NOT NULL DEFAULT 'continuous' CHECK (policy_type IN ('continuous', 'single_entry', 'term')),
-      coverage_amount NUMERIC(20, 2) NOT NULL,
-      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending', 'active', 'expired', 'cancelled', 'replaced')),
-      issued_at TIMESTAMPTZ,
-      expires_at TIMESTAMPTZ,
-      replaced_by_id UUID REFERENCES bonds(id),
-      stellar_contract_address TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_bonds_bond_number ON bonds(bond_number);
-    CREATE INDEX IF NOT EXISTS idx_bonds_importer_status ON bonds(importer_id, status, created_at DESC);
-
-    -- Migrate existing importers.bond_id values into bonds table
-    INSERT INTO bonds (importer_id, bond_number, policy_type, coverage_amount, status, issued_at, created_at)
-    SELECT id, bond_id, 'continuous', 0, 'active', created_at, created_at
-    FROM importers
-    WHERE NOT EXISTS (SELECT 1 FROM bonds WHERE bond_number = importers.bond_id);
-
-    -- #235: refresh_tokens — JWT refresh token flow with server-side revocation
-    CREATE TABLE IF NOT EXISTS refresh_tokens (
-      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      token_hash TEXT NOT NULL UNIQUE,
-      expires_at TIMESTAMPTZ NOT NULL,
-      revoked_at TIMESTAMPTZ,
-      replaced_by_id UUID REFERENCES refresh_tokens(id),
-      user_agent TEXT,
-      ip_address INET,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_importer_id
+      ON importer_metrics (importer_id);
   `,
     undefined,
     'migrate_schema'
