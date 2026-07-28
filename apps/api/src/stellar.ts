@@ -1,4 +1,4 @@
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, rpc } from '@stellar/stellar-sdk';
 import { TariffShieldClient } from '@tariffshield/sdk';
 import client from 'prom-client';
 import { trace, SpanStatusCode } from '@opentelemetry/api';
@@ -33,8 +33,63 @@ export const sorobanRpcDurationSeconds = new client.Histogram({
   buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
 });
 
-const rpcServer = createRpcServer(env.STELLAR_RPC_URL);
+// #249 — a single persistent Soroban RPC client, created once at module
+// load and reused by every call site (contractClient, getCurrentLedgerSequence,
+// pingRpc), instead of a new client (and underlying HTTP connection) per
+// request. Paired with keep-alive (enabled globally in rpcClient.ts), this
+// lets connections actually be reused instead of paying a fresh TCP/TLS
+// handshake on every call.
+let rpcServer = createRpcServer(env.STELLAR_RPC_URL);
 
+const RECONNECT_MAX_RETRIES = 3;
+const RECONNECT_BASE_DELAY_MS = 250;
+
+function isConnectionError(err: unknown): boolean {
+  const code = (err as { code?: string } | undefined)?.code;
+  return (
+    code === 'ECONNREFUSED' ||
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'EPIPE' ||
+    code === 'ENOTFOUND'
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs `fn` against the current singleton RPC server. If it fails with a
+ * connection-level error (as opposed to e.g. a validation error from the
+ * RPC endpoint itself), the singleton is rebuilt and the call retried with
+ * exponential backoff, up to RECONNECT_MAX_RETRIES times — this recovers
+ * from the RPC endpoint restarting without requiring the whole API process
+ * to restart.
+ */
+async function withRpcReconnect<T>(fn: (server: rpc.Server) => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= RECONNECT_MAX_RETRIES; attempt++) {
+    try {
+      return await fn(rpcServer);
+    } catch (err) {
+      lastErr = err;
+      if (!isConnectionError(err) || attempt === RECONNECT_MAX_RETRIES) {
+        throw err;
+      }
+      rpcServer = createRpcServer(env.STELLAR_RPC_URL);
+      await sleep(RECONNECT_BASE_DELAY_MS * 2 ** attempt);
+    }
+  }
+  throw lastErr;
+}
+
+// Note: TariffShieldClient stores the server instance it's given at
+// construction time (it doesn't expose a way to swap it later), so
+// contractClient calls don't get the reconnect-with-backoff behavior that
+// withRpcReconnect gives getCurrentLedgerSequence/pingRpc below — but they
+// do still benefit from the shared singleton + keep-alive, avoiding a new
+// connection per call.
 const baseClient = new TariffShieldClient({
   rpcUrl: env.STELLAR_RPC_URL,
   contractId: env.TARIFF_SHIELD_CONTRACT_ID,
@@ -83,7 +138,6 @@ export const explorerTx = (hash: string): string =>
   `https://stellar.expert/explorer/${env.STELLAR_NETWORK}/tx/${hash}`;
 
 export async function getCurrentLedgerSequence(): Promise<number> {
-  const server = createRpcServer(env.STELLAR_RPC_URL);
   const methodName = 'getLatestLedger';
   return tracer.startActiveSpan(`soroban.rpc.${methodName}`, async (span) => {
     span.setAttributes({
@@ -92,7 +146,7 @@ export async function getCurrentLedgerSequence(): Promise<number> {
     });
     const start = process.hrtime();
     try {
-      const latest = await server.getLatestLedger();
+      const latest = await withRpcReconnect((server) => server.getLatestLedger());
       const diff = process.hrtime(start);
       const duration = diff[0] + diff[1] / 1e9;
       sorobanRpcCallsTotal.inc({ method: methodName, success: 'true' });
@@ -116,8 +170,7 @@ export async function getCurrentLedgerSequence(): Promise<number> {
  * Pings the Soroban RPC server to check if it's reachable.
  */
 export async function pingRpc(): Promise<void> {
-  const server = createRpcServer(env.STELLAR_RPC_URL);
-  await server.getNetwork();
+  await withRpcReconnect((server) => server.getNetwork());
 }
 
 /**
