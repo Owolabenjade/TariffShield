@@ -8,12 +8,22 @@ const logger = pino({ name: 'db' });
 const url = new URL(env.DATABASE_URL);
 const sslRequired = url.searchParams.get('sslmode') === 'require';
 
+// Pool sizing (#241): max=20 by default caps concurrent connections well
+// under PostgreSQL's default max_connections=100, leaving headroom for
+// other API instances, migrations, and admin/monitoring connections when
+// running multiple replicas. idleTimeoutMillis recycles idle clients so
+// they don't sit open indefinitely; connectionTimeoutMillis fails fast
+// instead of queuing forever when the pool is saturated; statement_timeout
+// guards against a single runaway query holding a connection (and
+// blocking the pool) indefinitely.
 const basePool = new Pool({
   connectionString: env.DATABASE_URL,
   ssl: sslRequired ? { rejectUnauthorized: false } : undefined,
   max: env.PG_POOL_MAX,
   idleTimeoutMillis: env.PG_IDLE_TIMEOUT_MS,
   connectionTimeoutMillis: env.PG_CONN_TIMEOUT_MS,
+  statement_timeout: env.PG_STATEMENT_TIMEOUT_MS,
+  application_name: 'tariffshield-api',
 });
 
 // ── Pool monitoring (#264) ────────────────────────────────────────────────────
@@ -163,6 +173,25 @@ export const pool = {
   end: () => basePool.end(),
 };
 
+export interface PoolStats {
+  totalCount: number;
+  idleCount: number;
+  waitingCount: number;
+}
+
+/**
+ * Snapshot of the pool's own connection counters, for the /health/db
+ * endpoint (#241). These are always the source of truth — see the
+ * Prometheus gauges above, which read the same values on scrape.
+ */
+export function getPoolStats(): PoolStats {
+  return {
+    totalCount: basePool.totalCount,
+    idleCount: basePool.idleCount,
+    waitingCount: basePool.waitingCount,
+  };
+}
+
 // ── Schema migrations ─────────────────────────────────────────────────────────
 
 export async function migrate(): Promise<void> {
@@ -185,6 +214,12 @@ export async function migrate(): Promise<void> {
       user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
       legal_name TEXT NOT NULL,
       ein TEXT,
+      -- #243: SHA-256 hex digest of ein, for PII-safe equality lookups
+      -- (dedup checks, lookup-by-ein) without exposing the plaintext value.
+      -- ein itself is scheduled for encryption (see the ein_encrypted /
+      -- ein_key_version columns below, from the AES-GCM field-encryption
+      -- work) — ein_hash lets lookups keep working once that lands.
+      ein_hash TEXT,
       bond_id BIGINT UNIQUE NOT NULL,
       stellar_address TEXT NOT NULL,
       stellar_secret_encrypted TEXT,
@@ -465,6 +500,19 @@ export async function migrate(): Promise<void> {
     -- EIN is now stored as AES-256-GCM JSON; migrate existing plain text at app layer
     ALTER TABLE importers ADD COLUMN IF NOT EXISTS ein_encrypted TEXT;
     ALTER TABLE importers ADD COLUMN IF NOT EXISTS ein_key_version INTEGER REFERENCES field_encryption_key_versions(key_version);
+
+    -- #243: ein_hash for PII-safe equality lookups (see the importers table
+    -- comment above). Partial unique index — NULL eins (optional field)
+    -- never collide with each other or force uniqueness.
+    ALTER TABLE importers ADD COLUMN IF NOT EXISTS ein_hash TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_importers_ein_hash ON importers(ein_hash) WHERE ein_hash IS NOT NULL;
+
+    -- One-time backfill: compute ein_hash for any pre-existing row that has
+    -- a plaintext ein but no hash yet. Safe to re-run — only touches rows
+    -- still missing ein_hash.
+    UPDATE importers
+      SET ein_hash = encode(sha256(ein::bytea), 'hex')
+      WHERE ein IS NOT NULL AND ein_hash IS NULL;
 
     -- #318: regulatory compliance flags
     CREATE TABLE IF NOT EXISTS compliance_flags (
