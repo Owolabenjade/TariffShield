@@ -736,6 +736,87 @@ export async function rollback(): Promise<void> {
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_importer_id
       ON importer_metrics (importer_id);
+
+    -- Prevent UPDATE and DELETE on audit_log via row-level security
+    ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY audit_log_no_update ON audit_log FOR UPDATE USING (false);
+    CREATE POLICY audit_log_no_delete ON audit_log FOR DELETE USING (false);
+
+    -- #232: bonds — full bond lifecycle tracking (supersedes importers.bond_id)
+    -- NOTE: importers.bond_id is deprecated and retained for backward compatibility.
+    -- All new bond queries should use the bonds table instead.
+    CREATE TABLE IF NOT EXISTS bonds (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
+      bond_number BIGINT NOT NULL,
+      policy_type TEXT NOT NULL DEFAULT 'continuous' CHECK (policy_type IN ('continuous', 'single_entry', 'term')),
+      coverage_amount NUMERIC(20, 2) NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending', 'active', 'expired', 'cancelled', 'replaced')),
+      issued_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
+      replaced_by_id UUID REFERENCES bonds(id),
+      stellar_contract_address TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_bonds_bond_number ON bonds(bond_number);
+    CREATE INDEX IF NOT EXISTS idx_bonds_importer_status ON bonds(importer_id, status, created_at DESC);
+
+    -- Migrate existing importers.bond_id values into bonds table
+    INSERT INTO bonds (importer_id, bond_number, policy_type, coverage_amount, status, issued_at, created_at)
+    SELECT id, bond_id, 'continuous', 0, 'active', created_at, created_at
+    FROM importers
+    WHERE NOT EXISTS (SELECT 1 FROM bonds WHERE bond_number = importers.bond_id);
+
+    -- #235: refresh_tokens — JWT refresh token flow with server-side revocation
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ,
+      replaced_by_id UUID REFERENCES refresh_tokens(id),
+      user_agent TEXT,
+      ip_address INET,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
+
+    -- #244: importer_documents_view — joins importers with kyc_documents and
+    -- kyc_status in a single query for the surety admin review workflow, so
+    -- every API handler that touches the review flow doesn't need to
+    -- duplicate the JOIN. Depends on: kyc_status (#229), kyc_documents
+    -- (#234), and ein_hash (#243) — all already applied above.
+    -- importers.deleted_at (added by the importer_metrics work above) is
+    -- now filtered on too, so soft-deleted importers never appear in admin
+    -- review; kyc_documents' own deleted_at (its retention-schedule
+    -- deletion, unrelated to importer soft-delete) is filtered separately
+    -- so retention-expired documents don't appear either.
+    -- A plain view, not materialized — reads always reflect current data,
+    -- no refresh job needed (unlike importer_metrics_mv/importer_metrics above).
+    CREATE OR REPLACE VIEW importer_documents_view AS
+    SELECT
+      i.id AS importer_id,
+      i.legal_name,
+      i.ein_hash,
+      i.bond_id,
+      i.stellar_address,
+      i.kyc_status,
+      i.created_at AS importer_created_at,
+      d.id AS document_id,
+      d.document_type,
+      d.review_status AS document_review_status,
+      d.reviewer_id,
+      d.reviewer_note,
+      d.reviewed_at AS document_reviewed_at,
+      d.scheduled_deletion_date AS document_scheduled_deletion_date,
+      d.created_at AS document_created_at
+    FROM importers i
+    LEFT JOIN kyc_documents d
+      ON d.importer_id = i.id AND d.deleted_at IS NULL
+    WHERE i.deleted_at IS NULL;
   `,
     undefined,
     'migrate_schema'
@@ -809,12 +890,12 @@ export async function refreshImporterMetrics(): Promise<void> {
 
 /**
  * Refresh the importer_metrics materialized view concurrently without blocking reads.
- * 
+ *
  * Refresh Cadence:
  * - Triggered on-demand inside the tariff upload POST handler (`/importers/:id/upload-tariff-csv`).
  * - Can also be run on a background timer or cron (e.g. every 5 minutes) to sync async
  *   on-chain ledger events (deposits, withdrawals, clawbacks).
- * 
+ *
  * Staleness Window:
  * - Near-zero latency for tariff upload mutations since refresh is triggered immediately.
  * - Up to 5 minutes latency (or since last indexer run) for on-chain events if relying on periodic refresh.
@@ -827,6 +908,92 @@ export async function refreshImporterMetricsView(): Promise<void> {
   );
 }
 
+// ── importer_documents_view (#244) ─────────────────────────────────────────────
+
+export interface ImporterDocumentRow {
+  documentId: string;
+  documentType: string;
+  reviewStatus: string;
+  reviewerId: string | null;
+  reviewerNote: string | null;
+  reviewedAt: string | null;
+  scheduledDeletionDate: string;
+  createdAt: string;
+}
+
+export interface ImporterReview {
+  importerId: string;
+  legalName: string;
+  einHash: string | null;
+  bondId: string;
+  stellarAddress: string;
+  kycStatus: string;
+  importerCreatedAt: string;
+  documents: ImporterDocumentRow[];
+}
+
+/**
+ * Fetch a single importer's profile plus every kyc_documents row attached to
+ * it, from importer_documents_view — one query instead of the API handler
+ * doing its own JOIN. Returns null if no importer with this id exists.
+ * An importer with zero documents still returns (with documents: []) — the
+ * view's LEFT JOIN produces a single row with all document_* fields NULL,
+ * which this function filters out via the document_id IS NOT NULL check.
+ */
+export async function getImporterReview(
+  importerId: string
+): Promise<ImporterReview | null> {
+  const result = await timedQuery<{
+    importer_id: string;
+    legal_name: string;
+    ein_hash: string | null;
+    bond_id: string;
+    stellar_address: string;
+    kyc_status: string;
+    importer_created_at: Date;
+    document_id: string | null;
+    document_type: string | null;
+    document_review_status: string | null;
+    reviewer_id: string | null;
+    reviewer_note: string | null;
+    document_reviewed_at: Date | null;
+    document_scheduled_deletion_date: Date | null;
+    document_created_at: Date | null;
+  }>(
+    'SELECT * FROM importer_documents_view WHERE importer_id = $1',
+    [importerId],
+    'select_importer_documents_view'
+  );
+
+  const first = result.rows[0];
+  if (!first) {
+    return null;
+  }
+
+  const documents: ImporterDocumentRow[] = result.rows
+    .filter((row) => row.document_id !== null)
+    .map((row) => ({
+      documentId: row.document_id as string,
+      documentType: row.document_type as string,
+      reviewStatus: row.document_review_status as string,
+      reviewerId: row.reviewer_id,
+      reviewerNote: row.reviewer_note,
+      reviewedAt: row.document_reviewed_at?.toISOString() ?? null,
+      scheduledDeletionDate: (row.document_scheduled_deletion_date as Date).toISOString(),
+      createdAt: (row.document_created_at as Date).toISOString(),
+    }));
+
+  return {
+    importerId: first.importer_id,
+    legalName: first.legal_name,
+    einHash: first.ein_hash,
+    bondId: first.bond_id,
+    stellarAddress: first.stellar_address,
+    kycStatus: first.kyc_status,
+    importerCreatedAt: first.importer_created_at.toISOString(),
+    documents,
+  };
+}
 
 export async function getLastProcessedLedger(): Promise<number | null> {
   const result = await timedQuery<{ last_processed_ledger: number }>(
