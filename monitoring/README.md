@@ -26,6 +26,48 @@ The API exports three health check endpoints:
 - `/health/ready`: Readiness probe for deployment gates (Kubernetes/Render).
 - `/health/live`: Liveness probe (process heart-beat).
 
+## Prometheus Alert Routing
+
+### Alertmanager configuration
+
+Alertmanager configuration lives **outside this repository** in the infrastructure
+deployment repo. It consumes the rules from `monitoring/prometheus/alerts/` and routes
+them to notification channels based on label values. Contact the infrastructure team
+or check the internal Terraform/Helm configs for the active Alertmanager config file.
+
+### Label conventions
+
+All alert rules must carry the following labels so Alertmanager can route them
+to the correct receiver:
+
+| Label | Required values | Purpose |
+|---|---|---|
+| `severity` | `critical` or `warning` | Governs escalation urgency |
+| `team` | `backend` (all current alerts) | Routes to the team's Slack channel / on-call rotation |
+
+### Severity → notification channel mapping
+
+| Severity | Slack channel | PagerDuty escalation | Notes |
+|---|---|---|---|
+| `critical` | `#alerts-critical` | Yes — pages the on-call engineer immediately | Expect a response within 5 minutes |
+| `warning` | `#alerts-warning` | No — notification only | Investigate within the working day |
+
+### Alert inventory
+
+| Alert | File | Severity | Team | Runbook | Notification |
+|---|---|---|---|---|---|
+| `ContractEventIndexerHighLag` | `prometheus/alerts/indexer.yml` | critical | _(unset — see note)_ | [indexer-lag.md](runbooks/indexer-lag.md) | `#alerts-critical` + PagerDuty |
+| `ContractEventIndexerStalled` | `prometheus/alerts/indexer.yml` | critical | _(unset — see note)_ | [indexer-lag.md](runbooks/indexer-lag.md) | `#alerts-critical` + PagerDuty |
+| `ContractBalanceDriftDetected` | `prometheus/alerts/reconciliation.yml` | critical | backend | [balance-drift.md](runbooks/balance-drift.md) | `#alerts-critical` + PagerDuty |
+| `ReconciliationJobNotRunning` | `prometheus/alerts/reconciliation.yml` | critical | backend | [balance-drift.md](runbooks/balance-drift.md) | `#alerts-critical` + PagerDuty |
+| `DbSlowQueryRateHigh` | `prometheus/alerts/database.yml` | warning | backend | _(none)_ | `#alerts-warning` only |
+| `DbCriticalSlowQuery` | `prometheus/alerts/database.yml` | critical | backend | _(none)_ | `#alerts-critical` + PagerDuty |
+
+> **Gap:** `ContractEventIndexerHighLag` and `ContractEventIndexerStalled` are missing
+> the `team: backend` label. Until that label is added, Alertmanager cannot route them
+> to the backend team's receiver — they will fall through to the default receiver (if any).
+> See issue #763 / #762.
+
 ## Metrics & Dashboards
 
 - **Prometheus:** Scrapes metrics from `/metrics` on the API.

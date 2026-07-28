@@ -9,6 +9,7 @@ groups:
         annotations:
           summary: "TariffShield contract event indexer high lag"
           description: "The contract event indexer has been lagging by {{ $value }} ledgers (> 10) for more than 2 minutes."
+          runbook_url: "https://github.com/vjuliaife/TariffShield/blob/main/monitoring/runbooks/indexer-lag.md"
 
       - alert: ContractEventIndexerStalled
         expr: delta(contract_event_indexer_lag_ledgers[5m]) == 0 and contract_event_indexer_lag_ledgers > 0
@@ -18,3 +19,4 @@ groups:
         annotations:
           summary: "TariffShield contract event indexer stalled"
           description: "The contract event indexer lag has not decreased for more than 5 minutes, indicating that the indexer process has stalled."
+          runbook_url: "https://github.com/vjuliaife/TariffShield/blob/main/monitoring/runbooks/indexer-lag.md"
