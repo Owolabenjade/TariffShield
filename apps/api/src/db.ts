@@ -687,6 +687,24 @@ export async function migrate(): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
+
+    -- #234: documents — bond application PDF storage metadata (CBP Form 301,
+    -- power of attorney, commercial invoices, KYC ID, etc). Stores a reference
+    -- to the object-storage location, not the file bytes.
+    CREATE TABLE IF NOT EXISTS documents (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('cbp_301', 'power_of_attorney', 'commercial_invoice', 'kyc_id', 'other')),
+      filename TEXT NOT NULL,
+      url TEXT NOT NULL,
+      mime_type TEXT,
+      size_bytes BIGINT,
+      uploaded_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_documents_importer_kind ON documents(importer_id, kind, created_at DESC);
   `,
     undefined,
     "migrate_schema",
