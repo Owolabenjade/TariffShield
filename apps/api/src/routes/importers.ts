@@ -12,6 +12,12 @@ import { screenImporterEntity, screenWalletAddress } from "../services/aml-scree
 import { validateBondForm301 } from "../services/cbp-bond-validation.js";
 import { env } from "../config/env.js";
 import { enqueueTxSubmit, txSubmitQueue } from "../queue.js";
+import {
+  getCachedOnChainAccount,
+  setCachedOnChainAccount,
+  invalidateOnChainAccount,
+  type OnChainAccountView,
+} from "../cache.js";
 
 export const importersRouter = Router();
 importersRouter.use(authMiddleware);
@@ -186,7 +192,23 @@ importersRouter.get("/:id", async (req: Request, res: Response) => {
     res.status(404).json({ error: "not found" });
     return;
   }
-  const acct = await contractClient.getAccount(importer.stellar_address);
+
+  // #246 — cache-aside: serve on-chain state from Redis when fresh (<=30s
+  // old), otherwise fall back to the live Soroban RPC read and repopulate.
+  let onChainAccount = await getCachedOnChainAccount(importer.id);
+  if (!onChainAccount) {
+    const acct = await contractClient.getAccount(importer.stellar_address);
+    onChainAccount = {
+      bondId: acct.bondId.toString(),
+      collateralBalance: acct.collateralBalance.toString(),
+      requiredCollateral: acct.requiredCollateral.toString(),
+      reserveBalance: acct.reserveBalance.toString(),
+      yieldAccrued: acct.yieldAccrued.toString(),
+      isClawbacked: acct.isClawbacked,
+    } satisfies OnChainAccountView;
+    await setCachedOnChainAccount(importer.id, onChainAccount);
+  }
+
   res.json({
     importer: {
       id: importer.id,
@@ -197,14 +219,7 @@ importersRouter.get("/:id", async (req: Request, res: Response) => {
       registeredOnChainTx: importer.registered_on_chain_tx,
       createdAt: importer.created_at,
     },
-    onChainAccount: {
-      bondId: acct.bondId.toString(),
-      collateralBalance: acct.collateralBalance.toString(),
-      requiredCollateral: acct.requiredCollateral.toString(),
-      reserveBalance: acct.reserveBalance.toString(),
-      yieldAccrued: acct.yieldAccrued.toString(),
-      isClawbacked: acct.isClawbacked,
-    },
+    onChainAccount,
   });
 });
 
@@ -421,6 +436,11 @@ importersRouter.post("/:id/upload-tariff-csv", async (req: Request, res: Respons
 
     await logAudit(user.id, "apply_tariff_upload", importer.id, { filename: parse.data.filename, annualDutyTotal, requiredStroops: requiredStroops.toString() });
 
+    // #246 — required_collateral just changed on-chain; drop the cached
+    // account so the next GET /importers/:id reads the new value instead of
+    // serving a stale cache entry for up to 30s.
+    await invalidateOnChainAccount(importer.id);
+
     res.json({
       annualDutyTotal,
       bondFaceValue,
@@ -492,6 +512,12 @@ importersRouter.post("/:id/deposit", async (req: Request, res: Response) => {
     },
   });
   await logAudit(user.id, "deposit", importer.id, { bucket: parse.data.bucket, amountStroops: parse.data.amountStroops });
+
+  // #246 — the deposit tx submits asynchronously (see queue.ts), so this
+  // only clears whatever was cached from before the deposit was queued; the
+  // queue worker invalidates again once the tx actually lands on-chain.
+  await invalidateOnChainAccount(importer.id);
+
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
@@ -546,6 +572,11 @@ importersRouter.post("/:id/withdraw", async (req: Request, res: Response) => {
     },
   });
   await logAudit(user.id, "withdraw", importer.id, { amountStroops: parse.data.amountStroops });
+
+  // #246 — see the matching comment in POST /:id/deposit above: this covers
+  // the pre-confirmation window, the queue worker invalidates again on completion.
+  await invalidateOnChainAccount(importer.id);
+
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
@@ -600,6 +631,11 @@ importersRouter.post("/:id/clawback", requireLicenseVerified, async (req: Reques
       importerAddress: importer.stellar_address,
     },
   });
+
+  // #246 — see the matching comment in POST /:id/deposit above: this covers
+  // the pre-confirmation window, the queue worker invalidates again on completion.
+  await invalidateOnChainAccount(importer.id);
+
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
