@@ -1,0 +1,24 @@
+groups:
+  - name: importer-metrics-refresh-alerts
+    rules:
+      - alert: ImporterMetricsRefreshJobNotRunning
+        expr: rate(importer_metrics_refresh_runs_total[15m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: 'importer_metrics_mv refresh job is not running'
+          description: 'No importer_metrics_mv refresh attempts (success or failure) have been detected in the last 15 minutes. The surety dashboard is serving increasingly stale aggregate statistics.'
+          runbook_url: 'https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/importer-metrics-refresh.md'
+
+      - alert: ImporterMetricsRefreshJobFailing
+        expr: rate(importer_metrics_refresh_runs_total{outcome="failure"}[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: 'importer_metrics_mv refreshes are failing'
+          description: 'importer_metrics_mv refresh attempts have been failing for more than 10 minutes. The materialized view is now stale; check for a stuck concurrent refresh or a schema/index issue.'
+          runbook_url: 'https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/importer-metrics-refresh.md'

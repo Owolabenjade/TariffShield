@@ -1,0 +1,39 @@
+groups:
+  - name: tariffshield_http
+    rules:
+      - alert: HttpServerErrorRateHigh
+        expr: rate(http_requests_total{status_code=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Elevated HTTP 5xx error rate ({{ $value | humanize }}/s)"
+          description: >
+            More than 0.05 HTTP 5xx responses per second have been observed for
+            the last 5 minutes on instance {{ $labels.instance }}. Check
+            application logs and the OpenTelemetry traces (see
+            monitoring/README.md) for the failing route(s).
+          runbook_url: "https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/http-errors.md"
+
+      # Threshold rationale: 1s at p95 is a generous ceiling for this API (the
+      # slowest documented budget elsewhere in this file is the 2s single-query
+      # DbCriticalSlowQuery threshold in database.yml) — sustained p95 above 1s
+      # means a meaningful share of requests are being noticeably slow, not
+      # just an occasional outlier. `for: 5m` mirrors DbSlowQueryRateHigh's
+      # sustained-window pattern rather than firing on a single scrape spike.
+      - alert: HttpRequestLatencyHighP95
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High p95 HTTP request latency ({{ $value | humanize }}s)"
+          description: >
+            The 95th percentile HTTP request duration has been above 1s for
+            the last 5 minutes on instance {{ $labels.instance }}. Check the
+            OpenTelemetry traces (see monitoring/README.md) to find which
+            route(s) are slow and whether it correlates with a database or
+            Soroban RPC bottleneck.
+          runbook_url: "https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/http-latency.md"
