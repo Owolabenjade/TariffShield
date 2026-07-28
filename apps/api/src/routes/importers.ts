@@ -2,11 +2,22 @@ import { Router, type Request, type Response } from "express";
 import { createHash } from "crypto";
 import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import { pool, getImporterMetrics, refreshImporterMetricsView } from "../db.js";
+import {
+  pool,
+  getImporterMetrics,
+  refreshImporterMetricsView,
+  getImporterReview,
+} from "../db.js";
 import { adminRouter } from "./admin.js";
 import { authMiddleware, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { requireLicenseVerified } from "./surety-license.js";
-import { contractClient, explorerTx, platformKeypair, suretyKeypair } from "../stellar.js";
+import {
+  contractClient,
+  explorerTx,
+  platformKeypair,
+  suretyKeypair,
+  getRequiredCollateralOnChain,
+} from "../stellar.js";
 import { lookupCbpDutyRate } from "../services/cbp-duty-lookup.js";
 import { validateHtsRates } from "../services/hts-rate-validator.js";
 import { screenImporterEntity, screenWalletAddress } from "../services/aml-screening.js";
@@ -255,6 +266,39 @@ importersRouter.get('/admin/events', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[importers] Failed to query admin events:', err);
     res.status(500).json({ error: 'failed to retrieve events' });
+  }
+});
+
+// #244: single-query admin review — importer profile + all attached
+// kyc_documents rows, via importer_documents_view. Mounted under this
+// router's existing /importers prefix as /importers/admin/:id/review,
+// matching the /importers/admin/events convention just above (the issue's
+// literal "/admin/importers/:id/review" path doesn't compose with that
+// prefix). Registered before "/:id" for the same reason as /admin/events —
+// Express would otherwise try to match "admin" as an :id param.
+importersRouter.get('/admin/:id/review', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== 'surety_admin') {
+    res.status(403).json({ error: 'surety admin only' });
+    return;
+  }
+
+  const importerId = String(req.params.id ?? '');
+  if (!z.string().uuid().safeParse(importerId).success) {
+    res.status(400).json({ error: 'invalid importer id' });
+    return;
+  }
+
+  try {
+    const review = await getImporterReview(importerId);
+    if (!review) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json({ review });
+  } catch (err: any) {
+    console.error('[importers] Failed to query importer review:', err);
+    res.status(500).json({ error: 'failed to retrieve importer review' });
   }
 });
 
