@@ -784,6 +784,27 @@ export async function rollback(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
 
+    -- #234: documents — bond application PDF storage metadata (CBP Form 301,
+    -- power of attorney, commercial invoices, KYC ID, etc). Stores a reference
+    -- to the object-storage location, not the file bytes. Distinct from
+    -- kyc_documents (#312) below, which is specifically compliance
+    -- paperwork (articles of incorporation, EIN confirmation, beneficial
+    -- ownership) under its own retention/review workflow.
+    CREATE TABLE IF NOT EXISTS documents (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('cbp_301', 'power_of_attorney', 'commercial_invoice', 'kyc_id', 'other')),
+      filename TEXT NOT NULL,
+      url TEXT NOT NULL,
+      mime_type TEXT,
+      size_bytes BIGINT,
+      uploaded_by UUID REFERENCES users(id) ON DELETE SET NULL,
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_documents_importer_kind ON documents(importer_id, kind, created_at DESC);
+
     -- #244: importer_documents_view — joins importers with kyc_documents and
     -- kyc_status in a single query for the surety admin review workflow, so
     -- every API handler that touches the review flow doesn't need to
@@ -1202,6 +1223,22 @@ export async function logAudit(
      VALUES ($1, $2, $3, $4)`,
     [actorUserId, action, targetId, payload ? JSON.stringify(payload) : null],
     "insert_audit_log",
+  );
+}
+
+// ── #230: Notification helper ─────────────────────────────────────────────────
+//
+// Shared by any router that needs to raise an in-app notification for a user
+// (routes/notifications.ts doesn't call this itself — it only reads/updates
+// existing rows — but routes that produce the underlying events, like
+// routes/importers.ts, do), mirroring how logAudit above is shared the same
+// way for audit_log.
+export async function createNotification(userId: string, kind: string, message: string): Promise<void> {
+  await timedQuery(
+    `INSERT INTO notifications (user_id, kind, message)
+     VALUES ($1, $2, $3)`,
+    [userId, kind, message],
+    "insert_notification",
   );
 }
 
