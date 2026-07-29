@@ -413,6 +413,7 @@ importersRouter.get("/:id", async (req: Request, res: Response) => {
       bondId: importer.bond_id,
       stellarAddress: importer.stellar_address,
       registeredOnChainTx: importer.registered_on_chain_tx,
+      kycStatus: importer.kyc_status,
       createdAt: importer.created_at,
     },
     onChainAccount,
@@ -560,6 +561,16 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
     res.status(404).json({ error: 'not found' });
     return;
   }
+
+  // #229: block tariff-driven collateral requirement changes until KYC is approved.
+  if (importer.kyc_status !== 'approved') {
+    res.status(403).json({
+      error: 'KYC approval required before tariff uploads',
+      kycStatus: importer.kyc_status,
+    });
+    return;
+  }
+
   const parse = TariffUploadSchema.safeParse(req.body);
   if (!parse.success) {
     res.status(400).json({ error: 'invalid input', details: parse.error.issues });
@@ -790,6 +801,16 @@ importersRouter.post('/:id/auto-top-up', async (req: Request, res: Response) => 
     res.status(404).json({ error: 'not found' });
     return;
   }
+
+  // #229: block auto-top-up until KYC is approved (same rule as manual deposits).
+  if (importer.kyc_status !== 'approved') {
+    res.status(403).json({
+      error: 'KYC approval required before auto-top-up',
+      kycStatus: importer.kyc_status,
+    });
+    return;
+  }
+
   const jobId = await enqueueTxSubmit({
     method: 'auto_top_up',
     importerId: importer.id,
@@ -812,6 +833,16 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
     res.status(404).json({ error: 'not found' });
     return;
   }
+
+  // #229: block withdrawals until KYC is approved (same rule as deposits/auto-top-up).
+  if (importer.kyc_status !== 'approved') {
+    res.status(403).json({
+      error: 'KYC approval required before withdrawals',
+      kycStatus: importer.kyc_status,
+    });
+    return;
+  }
+
   const parse = WithdrawSchema.safeParse(req.body);
   if (!parse.success) {
     res.status(400).json({ error: 'invalid input' });

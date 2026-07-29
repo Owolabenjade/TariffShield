@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { pool } from "../db.js";
+import { pool, logAudit } from "../db.js";
 import { authMiddleware, requireRole, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { encryptFieldToJson, decryptFieldFromJson } from "../lib/field-encryption.js";
 import { env } from "../config/env.js";
@@ -129,6 +129,40 @@ kycRouter.get("/:id/kyc", async (req: Request, res: Response) => {
     [req.params.id],
   );
   res.json({ documents: docs.rows });
+});
+
+const UpdateKycStatusSchema = z.object({
+  kycStatus: z.enum(["pending", "approved", "rejected"]),
+});
+
+// PATCH /api/v1/importers/:id/kyc — directly set an importer's kyc_status
+// (surety_admin only). This is distinct from POST /:id/kyc/:docId/review
+// below, which derives kyc_status from document approvals; PATCH is a
+// direct administrative override for cases handled outside the document
+// workflow (e.g. KYC verified through an external channel).
+kycRouter.patch("/:id/kyc", requireRole("surety_admin"), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = UpdateKycStatusSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: "invalid input", details: parse.error.issues });
+    return;
+  }
+
+  const result = await pool.query(
+    `UPDATE importers SET kyc_status = $1
+     WHERE id = $2 AND deleted_at IS NULL
+     RETURNING id, kyc_status`,
+    [parse.data.kycStatus, req.params.id],
+  );
+  if (!result.rowCount) {
+    res.status(404).json({ error: "not found" });
+    return;
+  }
+
+  await logAudit(user.id, "kyc_status_update", result.rows[0]!.id, { kycStatus: parse.data.kycStatus });
+
+  res.json({ importerId: result.rows[0]!.id, kycStatus: result.rows[0]!.kyc_status });
 });
 
 // POST /api/v1/importers/:id/kyc/:docId/review — surety_admin approves/rejects a document

@@ -497,6 +497,11 @@ export async function rollback(): Promise<void> {
     ALTER TABLE importers ADD COLUMN IF NOT EXISTS kyc_status TEXT NOT NULL DEFAULT 'pending'
       CHECK (kyc_status IN ('pending', 'approved', 'rejected'));
 
+    -- #229: supports admin-dashboard filtering by KYC status and the
+    -- kyc_status = 'approved' guards added to the tariff-upload / deposit /
+    -- auto-top-up / withdraw routes.
+    CREATE INDEX IF NOT EXISTS idx_importers_kyc_status ON importers(kyc_status);
+
     -- #314: field encryption key version tracking
     CREATE TABLE IF NOT EXISTS field_encryption_key_versions (
       key_version INTEGER PRIMARY KEY,
