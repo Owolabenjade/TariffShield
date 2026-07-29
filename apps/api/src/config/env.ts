@@ -58,6 +58,8 @@ export const Env = z.object({
   // #312/#319 — S3 document storage
   S3_KYC_BUCKET: z.string().optional().describe("S3 bucket name for KYC document storage (SSE-KMS encrypted)"),
   S3_REPORTS_BUCKET: z.string().optional().describe("S3 bucket name for compliance report PDFs"),
+  // #234 — bond application document storage (CBP Form 301, power of attorney, commercial invoices, etc.)
+  S3_DOCUMENTS_BUCKET: z.string().optional().describe("S3 bucket name for bond application document storage"),
   AWS_REGION: z.string().default("us-east-1").describe("AWS region for S3/KMS operations"),
 
   // #319 — report email notifications

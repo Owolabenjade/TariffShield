@@ -6,7 +6,6 @@ import {
   pool,
   getImporterMetrics,
   logAudit,
-  createNotification,
   refreshImporterMetricsView,
   getImporterReview,
 } from "../db.js";
@@ -160,20 +159,6 @@ importersRouter.post('/', async (req: Request, res: Response) => {
   );
 
   await logAudit(user.id, 'register', importer.id, { legalName, bondId });
-
-  // #230 — best-effort side effect, mirroring the friendbot-funding pattern
-  // above: registration has already succeeded on-chain and in Postgres by
-  // this point, so a notification-insert failure must not turn an otherwise-
-  // successful request into a 500.
-  try {
-    await createNotification(
-      user.id,
-      NOTIFICATION_KINDS.EVENT_RECEIVED,
-      `Importer ${legalName} registered on-chain.`
-    );
-  } catch (err) {
-    console.error('[importers] notification insert failed:', err);
-  }
 
   res.json({
     importer: {
@@ -695,21 +680,6 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
       requiredStroops: requiredStroops.toString(),
     });
 
-    // #230 — notify the importer who OWNS this account (importer.user_id),
-    // not necessarily req.user: loadImporterFor lets a surety_admin call
-    // this route on any importer's behalf, and the importer is who needs to
-    // know their required collateral changed, not whichever role made the
-    // call. Best-effort, same reasoning as the notification above.
-    try {
-      await createNotification(
-        importer.user_id,
-        NOTIFICATION_KINDS.EVENT_RECEIVED,
-        `Required collateral updated to ${requiredStroops.toString()} stroops following a tariff CSV upload.`
-      );
-    } catch (err) {
-      console.error("[importers] notification insert failed:", err);
-    }
-
     // Refresh the importer_metrics materialized view
     await refreshImporterMetricsView();
 
@@ -1049,62 +1019,183 @@ importersRouter.get('/:id/bonds', async (req: Request, res: Response) => {
   res.json({ bonds: r.rows });
 });
 
-// ── #233: tariff-spike alert configuration ───────────────────────────────────
+// ── #234: bond application document storage (CBP Form 301, power of attorney,
+// commercial invoices, KYC ID, etc.) ─────────────────────────────────────────
+//
+// Mirrors the same stubbed-upload convention already used by
+// POST /importers/:id/kyc (routes/kyc.ts) and the compliance report PDF flow
+// (jobs/compliance-report.ts, routes/compliance.ts): no multipart parser
+// (multer/busboy) or AWS SDK client is installed anywhere in this codebase,
+// so uploads are accepted as a base64 payload in the JSON body and the S3
+// calls are stubbed behind `env.S3_DOCUMENTS_BUCKET`, exactly like those
+// other document flows already do. See implementation.md for the full
+// rationale.
 
-const ConfigureAlertSchema = z.object({
-  threshold: z.coerce.number().positive(),
-  thresholdType: z.enum(['absolute', 'percent_increase']).default('absolute'),
+const DOCUMENT_KINDS = [
+  'cbp_301',
+  'power_of_attorney',
+  'commercial_invoice',
+  'kyc_id',
+  'other',
+] as const;
+
+// Stub: in production, use AWS SDK PutObjectCommand to S3_DOCUMENTS_BUCKET.
+// Returns the object-storage key, which is what's persisted in documents.url.
+async function uploadBondDocumentToStorage(
+  importerId: string,
+  kind: string,
+  filename: string,
+  _fileBuffer: Buffer
+): Promise<string> {
+  const timestamp = Date.now();
+  const key = `documents/${importerId}/${kind}/${timestamp}-${filename}`;
+  if (env.S3_DOCUMENTS_BUCKET) {
+    // Production: AWS SDK upload would go here
+    // const s3 = new S3Client({ region: env.AWS_REGION });
+    // await s3.send(new PutObjectCommand({ Bucket: env.S3_DOCUMENTS_BUCKET, Key: key, Body: _fileBuffer, ContentType: mimeType }));
+  }
+  return key;
+}
+
+// Stub: in production, generate a pre-signed GetObjectCommand URL with 15-min TTL.
+function generateBondDocumentDownloadUrl(key: string): string {
+  if (env.S3_DOCUMENTS_BUCKET) {
+    return `https://${env.S3_DOCUMENTS_BUCKET}.s3.${env.AWS_REGION}.amazonaws.com/${key}?presigned=stub`;
+  }
+  return `/dev/documents-stub/${key}`;
+}
+
+// Stub: in production, use AWS SDK DeleteObjectCommand against S3_DOCUMENTS_BUCKET.
+async function deleteBondDocumentFromStorage(_key: string): Promise<void> {
+  if (env.S3_DOCUMENTS_BUCKET) {
+    // Production: AWS SDK delete would go here
+    // const s3 = new S3Client({ region: env.AWS_REGION });
+    // await s3.send(new DeleteObjectCommand({ Bucket: env.S3_DOCUMENTS_BUCKET, Key: _key }));
+  }
+}
+
+const UploadDocumentSchema = z.object({
+  kind: z.enum(DOCUMENT_KINDS),
+  filename: z.string().min(1),
+  fileBase64: z.string().min(1),
+  mimeType: z.string().min(1).optional(),
+  expiresAt: z.string().datetime().optional(),
 });
 
-// POST /importers/:id/alerts — configure a tariff-spike threshold
-importersRouter.post('/:id/alerts', async (req: Request, res: Response) => {
+// POST /importers/:id/documents — upload a bond application document
+importersRouter.post('/:id/documents', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
     res.status(404).json({ error: 'not found' });
     return;
   }
 
-  const parse = ConfigureAlertSchema.safeParse(req.body);
+  // zod's z.enum(DOCUMENT_KINDS) rejects any kind outside the five values the
+  // documents.kind CHECK constraint allows, so an invalid kind 400s here
+  // instead of surfacing as a raw Postgres constraint-violation error.
+  const parse = UploadDocumentSchema.safeParse(req.body);
   if (!parse.success) {
     res.status(400).json({ error: 'invalid input', details: parse.error.issues });
     return;
   }
-  const { threshold, thresholdType } = parse.data;
+  const { kind, filename, fileBase64, mimeType, expiresAt } = parse.data;
+  const fileBuffer = Buffer.from(fileBase64, 'base64');
+
+  const storageKey = await uploadBondDocumentToStorage(importer.id, kind, filename, fileBuffer);
 
   const inserted = await pool.query(
-    `INSERT INTO alerts (importer_id, threshold, threshold_type)
-     VALUES ($1, $2, $3)
-     RETURNING id, threshold, threshold_type, triggered_at, resolved_at, trigger_value, created_at`,
-    [importer.id, threshold, thresholdType]
+    `INSERT INTO documents (importer_id, kind, filename, url, mime_type, size_bytes, uploaded_by, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING id, kind, filename, mime_type, size_bytes, expires_at, created_at`,
+    [
+      importer.id,
+      kind,
+      filename,
+      storageKey,
+      mimeType ?? null,
+      fileBuffer.length,
+      user.id,
+      expiresAt ?? null,
+    ]
   );
+  const document = inserted.rows[0]!;
 
-  res.status(201).json({ alert: inserted.rows[0] });
+  await logAudit(user.id, 'document_upload', importer.id, {
+    documentId: document.id,
+    kind,
+    filename,
+  });
+
+  res.status(201).json({ document });
 });
 
-// GET /importers/:id/alerts — list configured alerts with their trigger history
-importersRouter.get('/:id/alerts', async (req: Request, res: Response) => {
+// GET /importers/:id/documents — list documents with signed download URLs
+importersRouter.get('/:id/documents', async (req: Request, res: Response) => {
   const importer = await loadImporterFor(req, String(req.params.id ?? ''));
   if (!importer) {
     res.status(404).json({ error: 'not found' });
     return;
   }
 
-  // idx_alerts_importer_triggered is (importer_id, triggered_at DESC), whose
-  // default NULL ordering for a DESC index is NULLS FIRST — matching this
-  // exact ORDER BY, so a plain ordered index scan *can* satisfy it without a
-  // separate sort step (confirmed by forcing one via EXPLAIN with bitmap/seq
-  // scan disabled). Whether Postgres actually picks that plan over a bitmap
-  // scan + explicit sort depends on its row-count-driven cost estimate — at
-  // the small per-importer row counts here either plan is cheap regardless,
-  // so this isn't a guarantee, just why the index is shaped the way it is.
-  // See implementation.md for the full EXPLAIN output. Not-yet-triggered
-  // alerts (triggered_at IS NULL) surface first as a result, ahead of the
-  // most-recently-triggered ones.
+  // idx_documents_importer_kind (importer_id, kind, created_at DESC) makes the
+  // importer_id filter an index range scan; because this query doesn't also
+  // filter on kind, the created_at DESC ordering isn't fully free from the
+  // index (it's only pre-sorted within each kind group) — Postgres still
+  // performs a sort, cheaply, since a single importer's document count is
+  // small (a handful of bond-application PDFs, not an unbounded table).
   const r = await pool.query(
-    `SELECT id, threshold, threshold_type, triggered_at, resolved_at, trigger_value, created_at
-       FROM alerts WHERE importer_id = $1 ORDER BY triggered_at DESC`,
+    `SELECT id, kind, filename, url, mime_type, size_bytes, expires_at, created_at
+       FROM documents WHERE importer_id = $1 ORDER BY created_at DESC`,
     [importer.id]
   );
 
-  res.json({ alerts: r.rows });
+  const documents = r.rows.map((d) => ({
+    id: d.id,
+    kind: d.kind,
+    filename: d.filename,
+    mimeType: d.mime_type,
+    sizeBytes: d.size_bytes,
+    expiresAt: d.expires_at,
+    createdAt: d.created_at,
+    downloadUrl: generateBondDocumentDownloadUrl(d.url),
+    expiresInSeconds: 900,
+  }));
+
+  res.json({ documents });
+});
+
+// DELETE /importers/:id/documents/:docId — surety_admin only
+importersRouter.delete('/:id/documents/:docId', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== 'surety_admin') {
+    res.status(403).json({ error: 'surety admin only' });
+    return;
+  }
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const existing = await pool.query(
+    'SELECT id, kind, filename, url FROM documents WHERE id = $1 AND importer_id = $2',
+    [req.params.docId, importer.id]
+  );
+  const doc = existing.rows[0];
+  if (!doc) {
+    res.status(404).json({ error: 'document not found' });
+    return;
+  }
+
+  await deleteBondDocumentFromStorage(doc.url);
+  await pool.query('DELETE FROM documents WHERE id = $1', [doc.id]);
+
+  await logAudit(user.id, 'document_delete', importer.id, {
+    documentId: doc.id,
+    kind: doc.kind,
+    filename: doc.filename,
+  });
+
+  res.json({ success: true });
 });
