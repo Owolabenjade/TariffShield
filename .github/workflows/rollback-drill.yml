@@ -3,8 +3,14 @@ name: Monthly Rollback Drill
 on:
   schedule:
     # Run on the first day of every month at 10:00 UTC
-    - cron: "0 10 1 * *"
+    - cron: '0 10 1 * *'
   workflow_dispatch: # Allow manual triggers
+
+# Declare least-privilege permissions to restrict GITHUB_TOKEN.
+# The workflow only needs to read repository contents to check out the code.
+# Secrets access is managed by the runner environment independently of GITHUB_TOKEN.
+permissions:
+  contents: read
 
 jobs:
   rollback-drill:
@@ -18,8 +24,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
+          node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
