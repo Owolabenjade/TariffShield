@@ -16,6 +16,7 @@ groups:
               SELECT query, total_exec_time, calls
               FROM pg_stat_statements
               ORDER BY total_exec_time DESC LIMIT 10;
+          runbook_url: "https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/database-slow-queries.md"
 
       - alert: DbCriticalSlowQuery
         expr: increase(db_slow_queries_total{threshold="2000ms"}[5m]) > 0
@@ -30,6 +31,7 @@ groups:
             Investigate immediately — check the API structured logs for
             { "level": "error", "caller": "<query_name>" } entries and review
             EXPLAIN ANALYZE output for the offending query.
+          runbook_url: "https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/database-slow-queries.md"
 
       # Mirrors the in-process check in apps/api/src/db.ts (WAITING_ALERT_THRESHOLD=5,
       # WAITING_ALERT_DURATION_MS=10s), which only logs a pino error and is not

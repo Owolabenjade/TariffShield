@@ -93,7 +93,6 @@ async function main() {
 
   console.log(`[rollback] Rolling back to wasm hash: ${previousWasmHash}`);
   console.log(`[rollback] Contract ID: ${contractId}`);
-}
 
   // Build upgrade transaction with previous wasm hash
   const wasmHashBuffer = Buffer.from(previousWasmHash, "hex");

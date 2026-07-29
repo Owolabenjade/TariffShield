@@ -324,7 +324,9 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 async function start() {
-  await migrate();
+  if (!isProduction) {
+    await migrate();
+  }
   await startIndexer();
   startReconciliationJob();
   await startOracleMonitor();
