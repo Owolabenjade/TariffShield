@@ -86,7 +86,7 @@ Enforcement mechanism: `authMiddleware` validates JWT and attaches the `role` cl
 | OFAC sanctions screening | All new importer registrations screened before DB write | `apps/api/src/routes/importers.ts` → `screenImporterEntity()` | `aml_screenings` table |
 | AML wallet screening | Wallet address screened at importer creation and on deposit/withdrawal | `apps/api/src/routes/importers.ts` | `aml_screenings` table |
 | Dependency vulnerability scanning | `npm audit --audit-level=high` on every PR | `.github/workflows/ci.yml` `audit` job | GitHub Actions logs; PR blocked on high-severity finding |
-| Static code analysis (SAST) | CodeQL JavaScript/TypeScript analysis weekly and on push to main | `.github/workflows/codeql.yml` | GitHub Security tab findings |
+| Static code analysis (SAST) | CodeQL JavaScript/TypeScript analysis weekly and on every pull request | `.github/workflows/codeql.yml` | GitHub Security tab findings |
 
 ---
 
@@ -136,3 +136,11 @@ TariffShield satisfies this requirement as follows:
 - **Password-based `surety_admin` accounts**: A TOTP-based second factor (e.g. Google Authenticator via `otplib`) must be implemented and enforced before the production launch of any surety admin account using password authentication. This is a documented pre-production requirement tracked as a control gap.
 - **`importer` accounts**: MFA is not required; brute-force protection (10-attempt lockout) serves as the compensating control.
 - **Platform admin (`admin`)**: Access is via Stellar keypair (`PLATFORM_STELLAR_SECRET`), which is stored in a secrets manager and never exposed through the API surface. Keypair access control (HSM, Vault policy, IAM role) is the equivalent of MFA for this role.
+
+---
+
+## Revision History
+
+| Date | Description | Author |
+|------|-------------|--------|
+| 2026-07-29 | Corrected CodeQL SAST trigger description to match `.github/workflows/codeql.yml` (`weekly and on every pull request`). (#751) | Security Engineering |
