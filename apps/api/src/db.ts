@@ -79,7 +79,7 @@ const POOL_CHECK_INTERVAL_MS = 1_000;
 let waitingBreachSince: number | null = null;
 let waitingAlertFired = false;
 
-setInterval(() => {
+const poolInterval = setInterval(() => {
   const waiting = basePool.waitingCount;
   if (waiting > WAITING_ALERT_THRESHOLD) {
     if (waitingBreachSince === null) {
@@ -96,6 +96,9 @@ setInterval(() => {
     waitingAlertFired = false;
   }
 }, POOL_CHECK_INTERVAL_MS);
+if (typeof poolInterval.unref === "function") {
+  poolInterval.unref();
+}
 
 // ── Prometheus metrics (#373) ─────────────────────────────────────────────────
 
@@ -170,6 +173,7 @@ async function timedQuery<R extends QueryResultRow = QueryResultRow>(
 
 export const pool = {
   query: timedQuery,
+  connect: () => basePool.connect(),
   end: () => basePool.end(),
 };
 
@@ -195,6 +199,13 @@ export function getPoolStats(): PoolStats {
 // ── Schema migrations ─────────────────────────────────────────────────────────
 
 export async function migrate(): Promise<void> {
+  const { runMigrations } = await import("./migrations/runner.js");
+  await runMigrations("up");
+}
+
+export async function rollback(): Promise<void> {
+  const { runMigrations } = await import("./migrations/runner.js");
+  await runMigrations("rollback");
   await timedQuery(
     `
     CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -692,18 +703,39 @@ export async function migrate(): Promise<void> {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_mv_singleton
       ON importer_metrics_mv (singleton_id);
 
-    -- #231: audit_log — append-only immutable action history for SOC 2 compliance
-    CREATE TABLE IF NOT EXISTS audit_log (
-      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-      actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-      action TEXT NOT NULL,
-      target_id TEXT,
-      payload JSONB,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    ALTER TABLE importers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
-    CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_user_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_id, created_at DESC);
+    CREATE MATERIALIZED VIEW IF NOT EXISTS importer_metrics AS
+    SELECT
+      i.id AS importer_id,
+      i.legal_name,
+      i.stellar_address,
+      COALESCE(t.latest_required_collateral, 0) AS required_collateral,
+      COALESCE(
+        SUM(CASE WHEN ce.kind IN ('deposit', 'deposit_collateral', 'deposit_reserve') THEN ce.amount ELSE 0 END) -
+        SUM(CASE WHEN ce.kind IN ('withdrawal', 'withdraw') THEN ce.amount ELSE 0 END), 0
+      ) AS current_balance,
+      COALESCE(t.latest_annual_duty_total, 0) AS annual_duty_total,
+      CASE WHEN COALESCE(t.latest_required_collateral, 0) > 0
+        THEN ROUND(
+          (SUM(CASE WHEN ce.kind IN ('deposit', 'deposit_collateral', 'deposit_reserve') THEN ce.amount ELSE 0 END) -
+           SUM(CASE WHEN ce.kind IN ('withdrawal', 'withdraw') THEN ce.amount ELSE 0 END))::NUMERIC
+          / t.latest_required_collateral, 4)
+        ELSE NULL END AS coverage_ratio,
+      now() AS refreshed_at
+    FROM importers i
+    LEFT JOIN LATERAL (
+      SELECT annual_duty_total AS latest_annual_duty_total,
+             computed_required_collateral AS latest_required_collateral
+      FROM tariff_uploads WHERE importer_id = i.id ORDER BY created_at DESC LIMIT 1
+    ) t ON true
+    LEFT JOIN contract_events ce ON ce.importer_id = i.id
+    WHERE i.deleted_at IS NULL
+    GROUP BY i.id, i.legal_name, i.stellar_address,
+             t.latest_annual_duty_total, t.latest_required_collateral;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_importer_metrics_importer_id
+      ON importer_metrics (importer_id);
 
     -- Prevent UPDATE and DELETE on audit_log via row-level security
     ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
@@ -766,6 +798,40 @@ export async function migrate(): Promise<void> {
     );
 
     CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, created_at DESC) WHERE read_at IS NULL;
+
+    -- #244: importer_documents_view — joins importers with kyc_documents and
+    -- kyc_status in a single query for the surety admin review workflow, so
+    -- every API handler that touches the review flow doesn't need to
+    -- duplicate the JOIN. Depends on: kyc_status (#229), kyc_documents
+    -- (#234), and ein_hash (#243) — all already applied above.
+    -- importers.deleted_at (added by the importer_metrics work above) is
+    -- now filtered on too, so soft-deleted importers never appear in admin
+    -- review; kyc_documents' own deleted_at (its retention-schedule
+    -- deletion, unrelated to importer soft-delete) is filtered separately
+    -- so retention-expired documents don't appear either.
+    -- A plain view, not materialized — reads always reflect current data,
+    -- no refresh job needed (unlike importer_metrics_mv/importer_metrics above).
+    CREATE OR REPLACE VIEW importer_documents_view AS
+    SELECT
+      i.id AS importer_id,
+      i.legal_name,
+      i.ein_hash,
+      i.bond_id,
+      i.stellar_address,
+      i.kyc_status,
+      i.created_at AS importer_created_at,
+      d.id AS document_id,
+      d.document_type,
+      d.review_status AS document_review_status,
+      d.reviewer_id,
+      d.reviewer_note,
+      d.reviewed_at AS document_reviewed_at,
+      d.scheduled_deletion_date AS document_scheduled_deletion_date,
+      d.created_at AS document_created_at
+    FROM importers i
+    LEFT JOIN kyc_documents d
+      ON d.importer_id = i.id AND d.deleted_at IS NULL
+    WHERE i.deleted_at IS NULL;
   `,
     undefined,
     'migrate_schema'
@@ -835,6 +901,113 @@ export async function refreshImporterMetrics(): Promise<void> {
     undefined,
     'refresh_importer_metrics_mv'
   );
+}
+
+/**
+ * Refresh the importer_metrics materialized view concurrently without blocking reads.
+ *
+ * Refresh Cadence:
+ * - Triggered on-demand inside the tariff upload POST handler (`/importers/:id/upload-tariff-csv`).
+ * - Can also be run on a background timer or cron (e.g. every 5 minutes) to sync async
+ *   on-chain ledger events (deposits, withdrawals, clawbacks).
+ *
+ * Staleness Window:
+ * - Near-zero latency for tariff upload mutations since refresh is triggered immediately.
+ * - Up to 5 minutes latency (or since last indexer run) for on-chain events if relying on periodic refresh.
+ */
+export async function refreshImporterMetricsView(): Promise<void> {
+  await timedQuery(
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY importer_metrics",
+    undefined,
+    "refresh_importer_metrics",
+  );
+}
+
+// ── importer_documents_view (#244) ─────────────────────────────────────────────
+
+export interface ImporterDocumentRow {
+  documentId: string;
+  documentType: string;
+  reviewStatus: string;
+  reviewerId: string | null;
+  reviewerNote: string | null;
+  reviewedAt: string | null;
+  scheduledDeletionDate: string;
+  createdAt: string;
+}
+
+export interface ImporterReview {
+  importerId: string;
+  legalName: string;
+  einHash: string | null;
+  bondId: string;
+  stellarAddress: string;
+  kycStatus: string;
+  importerCreatedAt: string;
+  documents: ImporterDocumentRow[];
+}
+
+/**
+ * Fetch a single importer's profile plus every kyc_documents row attached to
+ * it, from importer_documents_view — one query instead of the API handler
+ * doing its own JOIN. Returns null if no importer with this id exists.
+ * An importer with zero documents still returns (with documents: []) — the
+ * view's LEFT JOIN produces a single row with all document_* fields NULL,
+ * which this function filters out via the document_id IS NOT NULL check.
+ */
+export async function getImporterReview(
+  importerId: string
+): Promise<ImporterReview | null> {
+  const result = await timedQuery<{
+    importer_id: string;
+    legal_name: string;
+    ein_hash: string | null;
+    bond_id: string;
+    stellar_address: string;
+    kyc_status: string;
+    importer_created_at: Date;
+    document_id: string | null;
+    document_type: string | null;
+    document_review_status: string | null;
+    reviewer_id: string | null;
+    reviewer_note: string | null;
+    document_reviewed_at: Date | null;
+    document_scheduled_deletion_date: Date | null;
+    document_created_at: Date | null;
+  }>(
+    'SELECT * FROM importer_documents_view WHERE importer_id = $1',
+    [importerId],
+    'select_importer_documents_view'
+  );
+
+  const first = result.rows[0];
+  if (!first) {
+    return null;
+  }
+
+  const documents: ImporterDocumentRow[] = result.rows
+    .filter((row) => row.document_id !== null)
+    .map((row) => ({
+      documentId: row.document_id as string,
+      documentType: row.document_type as string,
+      reviewStatus: row.document_review_status as string,
+      reviewerId: row.reviewer_id,
+      reviewerNote: row.reviewer_note,
+      reviewedAt: row.document_reviewed_at?.toISOString() ?? null,
+      scheduledDeletionDate: (row.document_scheduled_deletion_date as Date).toISOString(),
+      createdAt: (row.document_created_at as Date).toISOString(),
+    }));
+
+  return {
+    importerId: first.importer_id,
+    legalName: first.legal_name,
+    einHash: first.ein_hash,
+    bondId: first.bond_id,
+    stellarAddress: first.stellar_address,
+    kycStatus: first.kyc_status,
+    importerCreatedAt: first.importer_created_at.toISOString(),
+    documents,
+  };
 }
 
 export async function getLastProcessedLedger(): Promise<number | null> {
