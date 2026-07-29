@@ -74,6 +74,33 @@ to the correct receiver:
 - **Grafana:** Visualizes API performance, error rates, and Soroban health.
 This directory contains Prometheus alert rules, Grafana dashboards, and runbooks.
 
+### Importing and Provisioning the Grafana Dashboard
+
+The API metrics dashboard configuration is stored in [tariffshield-api.json]. It references a Prometheus datasource via the `${DS_PROMETHEUS}` variable.
+
+#### Option 1: Manual Import via the Grafana UI
+1. Navigate to **Dashboards** > **New** > **Import** in the Grafana UI.
+2. Upload the `tariffshield-api.json` file or paste its JSON content.
+3. Grafana will detect the `__inputs` requirement for `DS_PROMETHEUS` and prompt you to select an active Prometheus datasource from a dropdown menu.
+4. Click **Import** to load the dashboard.
+
+#### Option 2: Automated Provisioning
+1. Mount the dashboard JSON file into the Grafana container (e.g. at `/var/lib/grafana/dashboards/tariffshield-api.json`).
+2. Add a provisioning configuration file in Grafana (e.g. `/etc/grafana/provisioning/dashboards/tariffshield.yaml`):
+   ```yaml
+   apiVersion: 1
+   providers:
+     - name: 'TariffShield'
+       orgId: 1
+       folder: ''
+       type: file
+       disableDeletion: false
+       editable: true
+       options:
+         path: /var/lib/grafana/dashboards
+   ```
+3. Grafana will automatically resolve the templating datasource variable `DS_PROMETHEUS` at startup to your active Prometheus datasource.
+
 ---
 
 ## OpenTelemetry Distributed Tracing (issue #368)
