@@ -9,6 +9,7 @@ import {
   refreshImporterMetricsView,
   getImporterReview,
 } from "../db.js";
+import { NOTIFICATION_KINDS } from "../constants/notification-kinds.js";
 import { adminRouter } from "./admin.js";
 import { authMiddleware, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { requireLicenseVerified } from "./surety-license.js";
@@ -483,6 +484,60 @@ const TariffUploadSchema = z.object({
   lineItems: z.array(TariffLineItemSchema),
 });
 
+// ── #233: tariff-spike alert evaluation, run after every tariff CSV upload ──
+//
+// "Active" == not yet triggered (triggered_at IS NULL); this is the
+// deduplication mechanism the issue describes — an alert fires once per
+// spike and then stays out of future evaluations, rather than re-notifying
+// on every subsequent upload that still breaches the same threshold. There's
+// no resolve/reset endpoint in this issue's scope, so a triggered alert stays
+// triggered until #230's notification/resolution flow (whatever it turns out
+// to be) adds one.
+//
+// `threshold_type = 'absolute'` compares the new upload's annual_duty_total
+// directly against the configured threshold. `'percent_increase'` compares
+// the percentage change against the importer's immediately preceding upload
+// (per the AC) — skipped entirely if there is no preceding upload, or if it
+// was exactly 0 (an increase off a zero baseline isn't a meaningful
+// percentage and would divide by zero).
+async function evaluateTariffAlerts(
+  importerId: string,
+  newAnnualDutyTotal: number,
+  previousAnnualDutyTotal: number | null
+): Promise<void> {
+  const active = await pool.query(
+    'SELECT id, threshold, threshold_type FROM alerts WHERE importer_id = $1 AND triggered_at IS NULL',
+    [importerId]
+  );
+
+  for (const alert of active.rows) {
+    const threshold = Number(alert.threshold);
+    let triggerValue: number | null = null;
+
+    if (alert.threshold_type === 'absolute') {
+      if (newAnnualDutyTotal >= threshold) {
+        triggerValue = newAnnualDutyTotal;
+      }
+    } else if (previousAnnualDutyTotal !== null && previousAnnualDutyTotal > 0) {
+      const pctIncrease =
+        ((newAnnualDutyTotal - previousAnnualDutyTotal) / previousAnnualDutyTotal) * 100;
+      if (pctIncrease >= threshold) {
+        triggerValue = pctIncrease;
+      }
+    }
+
+    if (triggerValue !== null) {
+      await pool.query('UPDATE alerts SET triggered_at = now(), trigger_value = $1 WHERE id = $2', [
+        triggerValue,
+        alert.id,
+      ]);
+      // #230 (notifications table) isn't implemented anywhere in this codebase
+      // yet — see implementation.md for the scope reconciliation. Nothing to
+      // insert into here until that lands.
+    }
+  }
+}
+
 importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Response) => {
   const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ''));
@@ -564,6 +619,18 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
   // Token is XLM in the demo (1 USD ≈ 1 XLM for stand-in); 7 decimals.
   const requiredStroops = BigInt(Math.round(requiredCollateralUSD * 1e7));
 
+  // #233: captured before this upload is inserted, so it's genuinely the
+  // *previous* upload for the percent_increase alert check below — not the
+  // row this request is about to create.
+  const previousUpload = await pool.query(
+    'SELECT annual_duty_total FROM tariff_uploads WHERE importer_id = $1 ORDER BY created_at DESC LIMIT 1',
+    [importer.id]
+  );
+  const previousAnnualDutyTotal =
+    previousUpload.rowCount && previousUpload.rowCount > 0
+      ? Number(previousUpload.rows[0]!.annual_duty_total)
+      : null;
+
   try {
     const onChain = await contractClient.setRequiredCollateral(
       [platformKeypair],
@@ -582,6 +649,18 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
         onChain.txHash,
       ]
     );
+
+    // #233: evaluate alert thresholds against this upload. Isolated in its
+    // own try/catch, matching the friendbot-funding pattern earlier in this
+    // file — the tariff upload and on-chain collateral update have already
+    // succeeded by this point, so a bug in alert evaluation must not turn
+    // into a 500 for an otherwise-successful request.
+    try {
+      await evaluateTariffAlerts(importer.id, annualDutyTotal, previousAnnualDutyTotal);
+    } catch (err) {
+      console.error('[importers] tariff alert evaluation failed:', err);
+    }
+
     await pool.query(
       `INSERT INTO contract_events (importer_id, kind, amount, tx_hash, ledger_sequence, event_index)
        VALUES ($1, 'required_changed', $2, $3, $4, $5)

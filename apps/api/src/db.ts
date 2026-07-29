@@ -1226,6 +1226,22 @@ export async function logAudit(
   );
 }
 
+// ── #230: Notification helper ─────────────────────────────────────────────────
+//
+// Shared by any router that needs to raise an in-app notification for a user
+// (routes/notifications.ts doesn't call this itself — it only reads/updates
+// existing rows — but routes that produce the underlying events, like
+// routes/importers.ts, do), mirroring how logAudit above is shared the same
+// way for audit_log.
+export async function createNotification(userId: string, kind: string, message: string): Promise<void> {
+  await timedQuery(
+    `INSERT INTO notifications (user_id, kind, message)
+     VALUES ($1, $2, $3)`,
+    [userId, kind, message],
+    "insert_notification",
+  );
+}
+
 // ── #235: Refresh token helpers ─────────────────────────────────────────────
 
 export async function createRefreshToken(
