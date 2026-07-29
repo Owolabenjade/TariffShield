@@ -6,7 +6,7 @@
       "CI / typecheck",
       "CI / lint",
       "CI / audit",
-      "CI / api-integration",
+      "API Integration Tests / api-integration",
       "CodeQL / analyze",
       "Vercel Preview / deploy"
     ]
