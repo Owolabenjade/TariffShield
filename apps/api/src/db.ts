@@ -784,22 +784,20 @@ export async function rollback(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash) WHERE revoked_at IS NULL;
 
-    -- #233: alerts — per-importer tariff-spike threshold configuration. Each
-    -- row is a configured threshold; triggered_at/trigger_value are filled in
-    -- by the evaluation that runs after every tariff CSV upload (see
-    -- routes/importers.ts), not at creation time.
-    CREATE TABLE IF NOT EXISTS alerts (
+    -- #230: notifications — in-app alerts decoupled from whatever event
+    -- produced them (bond status changes, KYC decisions, tariff spikes,
+    -- contract events). read_at is set once, on first read, and never
+    -- cleared, matching a standard "mark as read" model.
+    CREATE TABLE IF NOT EXISTS notifications (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
-      threshold NUMERIC(20, 2) NOT NULL,
-      threshold_type TEXT NOT NULL DEFAULT 'absolute' CHECK (threshold_type IN ('absolute', 'percent_increase')),
-      triggered_at TIMESTAMPTZ,
-      resolved_at TIMESTAMPTZ,
-      trigger_value NUMERIC(20, 2),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      message TEXT NOT NULL,
+      read_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
-    CREATE INDEX IF NOT EXISTS idx_alerts_importer_triggered ON alerts(importer_id, triggered_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, created_at DESC) WHERE read_at IS NULL;
 
     -- #244: importer_documents_view — joins importers with kyc_documents and
     -- kyc_status in a single query for the surety admin review workflow, so
@@ -1219,6 +1217,22 @@ export async function logAudit(
      VALUES ($1, $2, $3, $4)`,
     [actorUserId, action, targetId, payload ? JSON.stringify(payload) : null],
     "insert_audit_log",
+  );
+}
+
+// ── #230: Notification helper ─────────────────────────────────────────────────
+//
+// Shared by any router that needs to raise an in-app notification for a user
+// (routes/notifications.ts doesn't call this itself — it only reads/updates
+// existing rows — but routes that produce the underlying events, like
+// routes/importers.ts, do), mirroring how logAudit above is shared the same
+// way for audit_log.
+export async function createNotification(userId: string, kind: string, message: string): Promise<void> {
+  await timedQuery(
+    `INSERT INTO notifications (user_id, kind, message)
+     VALUES ($1, $2, $3)`,
+    [userId, kind, message],
+    "insert_notification",
   );
 }
 
