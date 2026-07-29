@@ -10,7 +10,7 @@ TariffShield spans three runtimes — Rust/Soroban, Node.js/Express, and Next.js
 
 1. **Contract unit tests first.** The Soroban contract holds funds on-chain and enforces invariants that cannot be patched after deployment. Every public entrypoint must have at least one test covering the happy path, every authorization boundary, and every error code. Contract tests run in a deterministic simulated Soroban environment with no network dependency.
 
-2. **API integration tests second.** The Express API connects contract state, PostgreSQL, and business rules. Integration tests run against a real (Docker) PostgreSQL instance using `supertest` so that SQL queries, constraint violations, and middleware chains are exercised as they would be in production. Mocking the database is avoided because mock/production divergence has caused silent breakage in the past.
+2. **API integration tests second.** The Express API connects contract state, PostgreSQL, and business rules. Integration tests run using Node's built-in `node:test` runner and `node:assert/strict`, issuing queries directly through a `pg` `Pool` against a real (Docker) PostgreSQL instance so that SQL queries and constraint violations are exercised as they would be in production. These tests currently operate at the database layer only — no HTTP requests are made against the Express app, so routes and middleware are not yet exercised this way. Mocking the database is avoided because mock/production divergence has caused silent breakage in the past.
 
 3. **SDK unit tests third.** The TypeScript SDK wraps Soroban RPC. Its unit tests mock the RPC layer to verify argument serialization, error mapping, and retry logic without requiring a live network.
 
@@ -34,7 +34,7 @@ TariffShield spans three runtimes — Rust/Soroban, Node.js/Express, and Next.js
 | Package | Testing Framework | Assertion Library | HTTP / RPC Mock | DB Strategy | Coverage Tool |
 |---------|------------------|-------------------|-----------------|-------------|---------------|
 | `contracts/tariff-shield` | `cargo test` | Rust `assert_eq!` / `assert!` | Soroban test env (in-process simulation) | N/A | `cargo llvm-cov` (not yet configured) |
-| `apps/api` | Jest or Vitest (pending) | Built-in matchers | `supertest` (real server, no mock) | Docker PostgreSQL (matches production schema) | `c8` or `jest --coverage` |
+| `apps/api` | `node:test` (built-in) | `node:assert/strict` | None — direct `pg` `Pool` queries, no HTTP layer | Docker PostgreSQL (matches production schema) | Not yet configured |
 | `packages/sdk` | Jest or Vitest (pending) | Built-in matchers | `msw` or `jest.fn()` mocking `rpc.Server` | N/A | `c8` or `jest --coverage` |
 | `apps/web` | Playwright v1.49 | Playwright assertions | Real API on localhost | N/A | Playwright trace files |
 
@@ -71,13 +71,13 @@ npm run test:e2e
 npx playwright test --reporter=html
 ```
 
-### API integration tests (when implemented)
+### API integration tests
 ```bash
-# From apps/api/ — requires Docker PostgreSQL running
-npm test
+# From apps/api/ — requires Docker PostgreSQL running and migrations applied
+npm run test:integration
 
-# Run a single test file
-npx jest src/__tests__/auth.test.ts
+# Equivalent (from repo root)
+npm run test:integration --workspace=apps/api
 ```
 
 ### SDK unit tests (when implemented)
