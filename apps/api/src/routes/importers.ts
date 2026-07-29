@@ -499,6 +499,60 @@ const TariffUploadSchema = z.object({
   lineItems: z.array(TariffLineItemSchema),
 });
 
+// ── #233: tariff-spike alert evaluation, run after every tariff CSV upload ──
+//
+// "Active" == not yet triggered (triggered_at IS NULL); this is the
+// deduplication mechanism the issue describes — an alert fires once per
+// spike and then stays out of future evaluations, rather than re-notifying
+// on every subsequent upload that still breaches the same threshold. There's
+// no resolve/reset endpoint in this issue's scope, so a triggered alert stays
+// triggered until #230's notification/resolution flow (whatever it turns out
+// to be) adds one.
+//
+// `threshold_type = 'absolute'` compares the new upload's annual_duty_total
+// directly against the configured threshold. `'percent_increase'` compares
+// the percentage change against the importer's immediately preceding upload
+// (per the AC) — skipped entirely if there is no preceding upload, or if it
+// was exactly 0 (an increase off a zero baseline isn't a meaningful
+// percentage and would divide by zero).
+async function evaluateTariffAlerts(
+  importerId: string,
+  newAnnualDutyTotal: number,
+  previousAnnualDutyTotal: number | null
+): Promise<void> {
+  const active = await pool.query(
+    'SELECT id, threshold, threshold_type FROM alerts WHERE importer_id = $1 AND triggered_at IS NULL',
+    [importerId]
+  );
+
+  for (const alert of active.rows) {
+    const threshold = Number(alert.threshold);
+    let triggerValue: number | null = null;
+
+    if (alert.threshold_type === 'absolute') {
+      if (newAnnualDutyTotal >= threshold) {
+        triggerValue = newAnnualDutyTotal;
+      }
+    } else if (previousAnnualDutyTotal !== null && previousAnnualDutyTotal > 0) {
+      const pctIncrease =
+        ((newAnnualDutyTotal - previousAnnualDutyTotal) / previousAnnualDutyTotal) * 100;
+      if (pctIncrease >= threshold) {
+        triggerValue = pctIncrease;
+      }
+    }
+
+    if (triggerValue !== null) {
+      await pool.query('UPDATE alerts SET triggered_at = now(), trigger_value = $1 WHERE id = $2', [
+        triggerValue,
+        alert.id,
+      ]);
+      // #230 (notifications table) isn't implemented anywhere in this codebase
+      // yet — see implementation.md for the scope reconciliation. Nothing to
+      // insert into here until that lands.
+    }
+  }
+}
+
 importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Response) => {
   const user = (req as AuthedRequest).user;
   const importer = await loadImporterFor(req, String(req.params.id ?? ''));
@@ -580,6 +634,18 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
   // Token is XLM in the demo (1 USD ≈ 1 XLM for stand-in); 7 decimals.
   const requiredStroops = BigInt(Math.round(requiredCollateralUSD * 1e7));
 
+  // #233: captured before this upload is inserted, so it's genuinely the
+  // *previous* upload for the percent_increase alert check below — not the
+  // row this request is about to create.
+  const previousUpload = await pool.query(
+    'SELECT annual_duty_total FROM tariff_uploads WHERE importer_id = $1 ORDER BY created_at DESC LIMIT 1',
+    [importer.id]
+  );
+  const previousAnnualDutyTotal =
+    previousUpload.rowCount && previousUpload.rowCount > 0
+      ? Number(previousUpload.rows[0]!.annual_duty_total)
+      : null;
+
   try {
     const onChain = await contractClient.setRequiredCollateral(
       [platformKeypair],
@@ -598,6 +664,18 @@ importersRouter.post('/:id/upload-tariff-csv', async (req: Request, res: Respons
         onChain.txHash,
       ]
     );
+
+    // #233: evaluate alert thresholds against this upload. Isolated in its
+    // own try/catch, matching the friendbot-funding pattern earlier in this
+    // file — the tariff upload and on-chain collateral update have already
+    // succeeded by this point, so a bug in alert evaluation must not turn
+    // into a 500 for an otherwise-successful request.
+    try {
+      await evaluateTariffAlerts(importer.id, annualDutyTotal, previousAnnualDutyTotal);
+    } catch (err) {
+      console.error('[importers] tariff alert evaluation failed:', err);
+    }
+
     await pool.query(
       `INSERT INTO contract_events (importer_id, kind, amount, tx_hash, ledger_sequence, event_index)
        VALUES ($1, 'required_changed', $2, $3, $4, $5)
@@ -969,4 +1047,64 @@ importersRouter.get('/:id/bonds', async (req: Request, res: Response) => {
   );
 
   res.json({ bonds: r.rows });
+});
+
+// ── #233: tariff-spike alert configuration ───────────────────────────────────
+
+const ConfigureAlertSchema = z.object({
+  threshold: z.coerce.number().positive(),
+  thresholdType: z.enum(['absolute', 'percent_increase']).default('absolute'),
+});
+
+// POST /importers/:id/alerts — configure a tariff-spike threshold
+importersRouter.post('/:id/alerts', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const parse = ConfigureAlertSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+  const { threshold, thresholdType } = parse.data;
+
+  const inserted = await pool.query(
+    `INSERT INTO alerts (importer_id, threshold, threshold_type)
+     VALUES ($1, $2, $3)
+     RETURNING id, threshold, threshold_type, triggered_at, resolved_at, trigger_value, created_at`,
+    [importer.id, threshold, thresholdType]
+  );
+
+  res.status(201).json({ alert: inserted.rows[0] });
+});
+
+// GET /importers/:id/alerts — list configured alerts with their trigger history
+importersRouter.get('/:id/alerts', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  // idx_alerts_importer_triggered is (importer_id, triggered_at DESC), whose
+  // default NULL ordering for a DESC index is NULLS FIRST — matching this
+  // exact ORDER BY, so a plain ordered index scan *can* satisfy it without a
+  // separate sort step (confirmed by forcing one via EXPLAIN with bitmap/seq
+  // scan disabled). Whether Postgres actually picks that plan over a bitmap
+  // scan + explicit sort depends on its row-count-driven cost estimate — at
+  // the small per-importer row counts here either plan is cheap regardless,
+  // so this isn't a guarantee, just why the index is shaped the way it is.
+  // See implementation.md for the full EXPLAIN output. Not-yet-triggered
+  // alerts (triggered_at IS NULL) surface first as a result, ahead of the
+  // most-recently-triggered ones.
+  const r = await pool.query(
+    `SELECT id, threshold, threshold_type, triggered_at, resolved_at, trigger_value, created_at
+       FROM alerts WHERE importer_id = $1 ORDER BY triggered_at DESC`,
+    [importer.id]
+  );
+
+  res.json({ alerts: r.rows });
 });
