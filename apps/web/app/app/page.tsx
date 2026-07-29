@@ -22,7 +22,7 @@ import { Nav } from "@/components/Nav";
 import { HealthScore } from "@/components/HealthScore";
 import { DepositWizard } from "@/components/DepositWizard";
 import { BondTimeline } from "@/components/BondTimeline";
-import { api, ApiError, type Importer, type ImporterDetail, stroopsToXlm } from "@/lib/api";
+import { api, ApiError, type Importer, type ImporterDetail, type ContractEvent, stroopsToXlm } from "@/lib/api";
 import { getUser, isAuthenticated } from "@/lib/auth";
 import { useYieldProjection } from "@/lib/workers/useYieldProjection";
 import * as Sentry from "@sentry/nextjs";
@@ -184,7 +184,7 @@ function ImporterDashboard() {
 
         {error ? <p className="mt-4 rounded border border-danger bg-danger/10 px-3 py-2 text-sm text-danger">{error}</p> : null}
 
-        <BondTimeline events={detail.events} />
+        <BondTimeline events={detail.events ?? []} />
 
         <div className="mt-10">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">On-chain event log</h2>
@@ -388,7 +388,6 @@ function EventLog({ importerId }: { importerId: string }) {
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- observer re-attach is driven by loadNextPage identity
   }, [loadNextPage, hasMore, loading, started]);
 
   return (

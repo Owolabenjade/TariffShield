@@ -130,8 +130,9 @@ export class TariffShieldClient {
     bypassRateLimit?: boolean,
     emergency?: boolean,
   ): Promise<InvokeResult<null>> {
+    const primary = signers[0]!;
     const args = [
-      addressToScVal(signer.publicKey()),
+      addressToScVal(primary.publicKey()),
       addressToScVal(importer),
       nativeToScVal(newRequired, { type: "i128" }),
     ];
@@ -145,11 +146,47 @@ export class TariffShieldClient {
     args.push(nativeToScVal(bypassRateLimit ?? false, { type: "bool" }));
     args.push(nativeToScVal(emergency ?? false, { type: "bool" }));
 
-    return this.invokeAndSubmit(signer, "set_required_collateral", args);
+    return this.invokeAndSubmitMulti(signers, "set_required_collateral", args, primary);
   }
 
   async autoTopUp(signer: Keypair, importer: string): Promise<InvokeResult<bigint>> {
     return this.invokeAndSubmit(signer, "auto_top_up", [addressToScVal(importer)]);
+  }
+
+  /**
+   * Execute auto_top_up across multiple importers concurrently with a concurrency cap.
+   * Uses Promise.allSettled concurrency model so individual item failures do not abort the batch.
+   */
+  async batchAutoTopUp(
+    signer: Keypair,
+    importers: string[],
+    concurrencyLimit = 10,
+  ): Promise<Array<{ importer: string; result?: InvokeResult<bigint>; error?: Error }>> {
+    const results: Array<{ importer: string; result?: InvokeResult<bigint>; error?: Error }> = new Array(
+      importers.length,
+    );
+    let index = 0;
+
+    const worker = async () => {
+      while (index < importers.length) {
+        const i = index++;
+        const importer = importers[i]!;
+        try {
+          const res = await this.autoTopUp(signer, importer);
+          results[i] = { importer, result: res };
+        } catch (err: any) {
+          results[i] = {
+            importer,
+            error: err instanceof Error ? err : new Error(String(err)),
+          };
+        }
+      }
+    };
+
+    const limit = Math.max(1, Math.min(concurrencyLimit, importers.length));
+    const workers = Array.from({ length: limit }, () => worker());
+    await Promise.all(workers);
+    return results;
   }
 
   async withdrawCollateral(
