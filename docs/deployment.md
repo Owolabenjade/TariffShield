@@ -33,6 +33,7 @@ These environment variables are validated at startup via Zod in [env.ts](file://
 | `PORT` | No (default: `3002`) | Port the Express API server listens on | `3002` |
 | `NODE_ENV` | No (default: `development`) | Runtime environment: `development`, `production`, `test` | `production` |
 | `DATABASE_URL` | **Yes** | Connection string for PostgreSQL database | `postgres://user:pass@host:5432/db?sslmode=require` |
+| `REDIS_URL` | No (default: `redis://localhost:6379`) | Redis connection string, shared by the BullMQ job queue and the on-chain account state cache (#246 — `GET /importers/:id`, 30s TTL) | `redis://user:pass@host:6379` |
 | `FRONTEND_ORIGIN` | No (default: `http://localhost:3000`) | CORS allowed origin for client browsers | `https://tariffshield.vercel.app` |
 | `JWT_SECRET` | **Yes** | 32+ character HMAC key for signing JWT tokens | `super-secret-jwt-key-at-least-32-chars-long` |
 | `STELLAR_NETWORK` | No (default: `testnet`) | Network to target: `testnet` or `public` | `testnet` |

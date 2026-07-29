@@ -4,6 +4,7 @@ import { env } from "./config/env.js";
 import { pool } from "./db.js";
 import { contractClient, platformKeypair, suretyKeypair } from "./stellar.js";
 import { Keypair } from "@stellar/stellar-sdk";
+import { invalidateOnChainAccount } from "./cache.js";
 
 export interface TxSubmitJobData {
   method: "deposit" | "auto_top_up" | "withdraw" | "accrue_yield" | "clawback" | "set_required_collateral" | "register";
@@ -143,6 +144,15 @@ export function createTxSubmitWorker() {
          ON CONFLICT (ledger_sequence, event_index) DO NOTHING`,
         [importerId, eventKind, eventAmount, onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder],
       );
+
+      // #246 — the route that enqueued this job already invalidated the
+      // cache once (see routes/importers.ts), but that happened before this
+      // tx was confirmed on-chain. Invalidate again now, on confirmation, so
+      // a GET that landed (and re-cached) in between doesn't leave stale
+      // pre-write state cached for the rest of the 30s TTL.
+      if (method === "deposit" || method === "withdraw" || method === "clawback") {
+        await invalidateOnChainAccount(importerId);
+      }
 
       return {
         txHash: onChain.txHash,
