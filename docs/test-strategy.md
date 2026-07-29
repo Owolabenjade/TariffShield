@@ -22,10 +22,16 @@ TariffShield spans three runtimes — Rust/Soroban, Node.js/Express, and Next.js
 
 | Category | Location | Framework / Tooling | Status |
 |----------|----------|---------------------|--------|
-| Soroban contract unit tests | `contracts/tariff-shield/src/test.rs` | `cargo test` + `soroban-sdk` testutils | Active (42 tests) |
+| Soroban contract unit tests | `contracts/tariff-shield/src/test.rs` | `cargo test` + `soroban-sdk` testutils | Active (40 tests) |
 | API integration tests | `apps/api/src/__tests__/` | supertest + Jest or Vitest (to be added) | Placeholder in CI |
 | SDK unit tests | `packages/sdk/src/__tests__/` | Jest or Vitest + fetch mock | Not yet implemented |
 | E2E tests | `apps/web/e2e/` | Playwright v1.49, Desktop Chrome | Active (3 specs) |
+
+> **Keeping the contract test count accurate:** the "(N tests)" figure above is a snapshot, not a generated value, so it drifts whenever `test.rs` gains or loses `#[test]` functions. Verify it before relying on it:
+> ```bash
+> grep -c '#\[test\]' contracts/tariff-shield/src/test.rs
+> ```
+> CI check idea: add a lightweight step (e.g. to `lint` or a new `docs-check` job) that runs the grep above and fails the build if the count doesn't match the number recorded in this file, so a stale count is caught at PR time instead of by manual audit.
 
 ---
 
