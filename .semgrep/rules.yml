@@ -4,16 +4,19 @@ rules:
     message: "Potential hardcoded secret or private key assignment detected."
     severity: ERROR
     pattern-either:
-      - pattern: |
-          $VAR = "S$KEY"
-        metavariable-regex:
-          metavariable: $KEY
-          regex: '^[A-Z2-7]{55}$'
-      - pattern: |
-          const $VAR = "S$KEY";
-        metavariable-regex:
-          metavariable: $KEY
-          regex: '^[A-Z2-7]{55}$'
+      - patterns:
+          - pattern: |
+              $VAR = "S$KEY"
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: '^[A-Z2-7]{55}$'
+      - patterns:
+          - pattern: |
+              const $VAR = "S$KEY";
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: '^[A-Z2-7]{55}$'
+
 
   - id: tariffshield-missing-authorization-check
     languages: [javascript, typescript]

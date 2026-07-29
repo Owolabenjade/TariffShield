@@ -27,6 +27,12 @@ TariffShield spans three runtimes — Rust/Soroban, Node.js/Express, and Next.js
 | SDK unit tests | `packages/sdk/src/__tests__/` | Jest or Vitest + fetch mock | Not yet implemented |
 | E2E tests | `apps/web/e2e/` | Playwright v1.49, Desktop Chrome | Active (3 specs) |
 
+> **Keeping the contract test count accurate:** the "(N tests)" figure above is a snapshot, not a generated value, so it drifts whenever `test.rs` gains or loses `#[test]` functions. Verify it before relying on it:
+> ```bash
+> grep -c '#\[test\]' contracts/tariff-shield/src/test.rs
+> ```
+> CI check idea: add a lightweight step (e.g. to `lint` or a new `docs-check` job) that runs the grep above and fails the build if the count doesn't match the number recorded in this file, so a stale count is caught at PR time instead of by manual audit.
+
 ---
 
 ## Frameworks and Tools
@@ -34,7 +40,7 @@ TariffShield spans three runtimes — Rust/Soroban, Node.js/Express, and Next.js
 | Package | Testing Framework | Assertion Library | HTTP / RPC Mock | DB Strategy | Coverage Tool |
 |---------|------------------|-------------------|-----------------|-------------|---------------|
 | `contracts/tariff-shield` | `cargo test` | Rust `assert_eq!` / `assert!` | Soroban test env (in-process simulation) | N/A | `cargo llvm-cov` (not yet configured) |
-| `apps/api` | Jest or Vitest (pending) | Built-in matchers | `supertest` (real server, no mock) | Docker PostgreSQL (matches production schema) | `c8` or `jest --coverage` |
+| `apps/api` | `node:test` (built-in) | `node:assert/strict` | None — direct `pg` `Pool` queries, no HTTP layer | Docker PostgreSQL (matches production schema) | Not yet configured |
 | `packages/sdk` | Jest or Vitest (pending) | Built-in matchers | `msw` or `jest.fn()` mocking `rpc.Server` | N/A | `c8` or `jest --coverage` |
 | `apps/web` | Playwright v1.49 | Playwright assertions | Real API on localhost | N/A | Playwright trace files |
 
@@ -71,13 +77,13 @@ npm run test:e2e
 npx playwright test --reporter=html
 ```
 
-### API integration tests (when implemented)
+### API integration tests
 ```bash
-# From apps/api/ — requires Docker PostgreSQL running
-npm test
+# From apps/api/ — requires Docker PostgreSQL running and migrations applied
+npm run test:integration
 
-# Run a single test file
-npx jest src/__tests__/auth.test.ts
+# Equivalent (from repo root)
+npm run test:integration --workspace=apps/api
 ```
 
 ### SDK unit tests (when implemented)
