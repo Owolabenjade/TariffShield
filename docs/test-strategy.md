@@ -10,7 +10,7 @@ TariffShield spans three runtimes — Rust/Soroban, Node.js/Express, and Next.js
 
 1. **Contract unit tests first.** The Soroban contract holds funds on-chain and enforces invariants that cannot be patched after deployment. Every public entrypoint must have at least one test covering the happy path, every authorization boundary, and every error code. Contract tests run in a deterministic simulated Soroban environment with no network dependency.
 
-2. **API integration tests second.** The Express API connects contract state, PostgreSQL, and business rules. Integration tests run against a real (Docker) PostgreSQL instance using `supertest` so that SQL queries, constraint violations, and middleware chains are exercised as they would be in production. Mocking the database is avoided because mock/production divergence has caused silent breakage in the past.
+2. **API integration tests second.** The Express API connects contract state, PostgreSQL, and business rules. Integration tests run against a real (Docker) PostgreSQL instance so that SQL queries and constraint violations are exercised as they would be in production. Mocking the database is avoided because mock/production divergence has caused silent breakage in the past. Coverage is currently minimal: `apps/api/src/__tests__/integration/bonds.test.ts` verifies a bond record insert and the `bond_type_code` check-constraint enforcement (issue #747). Auth boundaries, error paths, and happy-path HTTP routes are not yet covered — see "What to Test" below.
 
 3. **SDK unit tests third.** The TypeScript SDK wraps Soroban RPC. Its unit tests mock the RPC layer to verify argument serialization, error mapping, and retry logic without requiring a live network.
 
@@ -23,7 +23,7 @@ TariffShield spans three runtimes — Rust/Soroban, Node.js/Express, and Next.js
 | Category | Location | Framework / Tooling | Status |
 |----------|----------|---------------------|--------|
 | Soroban contract unit tests | `contracts/tariff-shield/src/test.rs` | `cargo test` + `soroban-sdk` testutils | Active (42 tests) |
-| API integration tests | `apps/api/src/__tests__/` | supertest + Jest or Vitest (to be added) | Placeholder in CI |
+| API integration tests | `apps/api/src/__tests__/` | supertest + Jest or Vitest (to be added) | Active — minimal (2 tests in `bonds.test.ts`) |
 | SDK unit tests | `packages/sdk/src/__tests__/` | Jest or Vitest + fetch mock | Not yet implemented |
 | E2E tests | `apps/web/e2e/` | Playwright v1.49, Desktop Chrome | Active (3 specs) |
 
@@ -136,9 +136,9 @@ Tests are executed by GitHub Actions (`.github/workflows/ci.yml`):
 | `typecheck` | Every PR and push to `main` | Yes — runs `tsc --noEmit` on `apps/web` |
 | `lint` | Every PR and push to `main` | Yes — runs `next lint` on `apps/web` |
 | `audit` | Every PR and push to `main` | Yes — `npm audit --audit-level=high` |
-| `api-integration` | Every PR and push to `main` | Placeholder (currently passes with no tests) |
+| `api-integration` | Every PR and push to `main` | Yes — runs `npm run test:integration --workspace=apps/api` against real minimal tests (issue #747) |
 | E2E (`e2e.yml`) | On Vercel deployment status event | No — informational on staging |
 
-**Policy:** a PR may not merge if `test`, `typecheck`, `lint`, or `audit` fail. The `api-integration` job will become blocking once tests are implemented.
+**Policy:** a PR may not merge if `test`, `typecheck`, `lint`, `audit`, or `api-integration` fail. `.github/protection.json` already lists `CI / api-integration` as a required status check, so it is blocking today, not pending a future milestone — the coverage behind it is simply still minimal (see "Testing Philosophy" and "What to Test" above).
 
 Tests that require secrets (Stellar keys, database) use GitHub Actions environment secrets and do not run on fork PRs from external contributors unless a maintainer approves the workflow run.
