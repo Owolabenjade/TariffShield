@@ -27,7 +27,7 @@ These workflow jobs must pass before a PR can merge:
 | `CI / typecheck` | `.github/workflows/ci.yml` | `typecheck` |
 | `CI / lint` | `.github/workflows/ci.yml` | `lint` |
 | `CI / audit` | `.github/workflows/ci.yml` | `audit` |
-| `CI / api-integration` | `.github/workflows/ci.yml` | `api-integration` |
+| `API Integration Tests / api-integration` | `.github/workflows/api-integration.yml` | `api-integration` |
 | `CodeQL / analyze` | `.github/workflows/codeql.yml` | `analyze` |
 | `Vercel Preview / deploy` | `.github/workflows/preview-deploy.yml` | `deploy` |
 
