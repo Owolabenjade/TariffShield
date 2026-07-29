@@ -1,10 +1,54 @@
 import { Command } from "commander";
-import { Keypair, TransactionBuilder, Networks, SorobanRpc, Contract, xdr } from "@stellar/stellar-sdk";
+import {
+  Address,
+  Contract,
+  Keypair,
+  Networks,
+  Operation,
+  TransactionBuilder,
+  Transaction,
+  rpc,
+  scValToNative,
+  hash,
+} from "@stellar/stellar-sdk";
+import { randomBytes } from "crypto";
 import { readFileSync } from "fs";
 import { env } from "../apps/api/src/config/env.js";
-import { contractClient, platformKeypair } from "../apps/api/src/stellar.js";
+import { platformKeypair } from "../apps/api/src/stellar.js";
 
 const program = new Command();
+
+const TX_TIMEOUT_SECONDS = 30;
+const SUBMIT_POLL_INTERVAL_MS = 1500;
+const SUBMIT_DEADLINE_MS = 60_000;
+
+/** Submits a prepared, signed transaction and polls until it lands, mirroring
+ * packages/sdk/src/index.ts's invokeAndSubmit. Returns the transaction's
+ * parsed return value (e.g. the new contract's Address for a create-contract
+ * host function invocation). */
+async function submitAndWait(
+  rpcServer: rpc.Server,
+  tx: Transaction,
+  signer: Keypair,
+): Promise<unknown> {
+  const prepared = await rpcServer.prepareTransaction(tx);
+  prepared.sign(signer);
+  const sendResponse = await rpcServer.sendTransaction(prepared);
+  if (sendResponse.status === "ERROR") {
+    throw new Error(`send failed: ${JSON.stringify(sendResponse.errorResult)}`);
+  }
+
+  let txResult = await rpcServer.getTransaction(sendResponse.hash);
+  const deadline = Date.now() + SUBMIT_DEADLINE_MS;
+  while (txResult.status === "NOT_FOUND" && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, SUBMIT_POLL_INTERVAL_MS));
+    txResult = await rpcServer.getTransaction(sendResponse.hash);
+  }
+  if (txResult.status !== "SUCCESS") {
+    throw new Error(`tx ${sendResponse.hash} status=${txResult.status}`);
+  }
+  return txResult.returnValue ? scValToNative(txResult.returnValue) : null;
+}
 
 program
   .name("upgrade-dry-run")
@@ -14,41 +58,84 @@ program
   .action(async (options) => {
     try {
       console.log(`Starting upgrade dry-run for ${options.wasmPath} on ${options.network}...`);
-      
-      const rpcServer = new SorobanRpc.Server(env.STELLAR_RPC_URL);
+
+      const rpcServer = new rpc.Server(env.STELLAR_RPC_URL);
       const wasmBuffer = readFileSync(options.wasmPath);
       const networkPassphrase = options.network === "public" ? Networks.PUBLIC : Networks.TESTNET;
 
-      // 1. Simulate the upgrade call
-      // Because we added multi-sig, we simulate propose_upgrade, but to really simulate
-      // a wasm change we'd need to simulate the execution of `update_current_contract_wasm`.
-      // The simulation API can simulate any transaction. Let's build a transaction that calls approve_upgrade
-      // if we had an active proposal, or we can just construct an arbitrary transaction that does `update_current_contract_wasm`.
-      // The simplest way to dry-run is to simulate `propose_upgrade` and assume it works.
-      
-      const source = await rpcServer.getAccount(platformKeypair.publicKey());
-      
-      const contract = new Contract(env.TARIFF_SHIELD_CONTRACT_ID);
-      
-      // We will invoke `version` first to verify basic communication
-      let tx = new TransactionBuilder(source, {
+      // A genuine dry-run has to actually exercise the CANDIDATE wasm's code
+      // paths, not the already-deployed contract's. Calling version() on the
+      // live contract (the old behavior here) tells you nothing about the
+      // new wasm at all. Instead: upload the candidate wasm and deploy it as
+      // a throwaway contract instance (a real Soroban contract, but entirely
+      // separate from TARIFF_SHIELD_CONTRACT_ID — the live contract's
+      // storage is never touched), then invoke the new instance's own
+      // version() against it. A wasm with a storage-layout or
+      // deserialization incompatibility fails here, on the throwaway
+      // instance, exactly as it would if actually deployed.
+      console.log(`Uploading candidate wasm (${wasmBuffer.length} bytes)...`);
+      const uploaderAccount = await rpcServer.getAccount(platformKeypair.publicKey());
+      const uploadTx = new TransactionBuilder(uploaderAccount, {
+        fee: "1000000",
+        networkPassphrase,
+      })
+        .addOperation(Operation.uploadContractWasm({ wasm: wasmBuffer }))
+        .setTimeout(TX_TIMEOUT_SECONDS)
+        .build();
+      await submitAndWait(rpcServer, uploadTx, platformKeypair);
+      const wasmHash = hash(wasmBuffer);
+      console.log(`✅ Candidate wasm uploaded (hash ${wasmHash.toString("hex")})`);
+
+      console.log(`Deploying a throwaway instance of the candidate wasm...`);
+      const deployerAccount = await rpcServer.getAccount(platformKeypair.publicKey());
+      const salt = randomBytes(32);
+      const deployTx = new TransactionBuilder(deployerAccount, {
+        fee: "1000000",
+        networkPassphrase,
+      })
+        .addOperation(
+          Operation.createCustomContract({
+            wasmHash,
+            address: Address.fromString(platformKeypair.publicKey()),
+            salt,
+          }),
+        )
+        .setTimeout(TX_TIMEOUT_SECONDS)
+        .build();
+      const deployedAddress = await submitAndWait(rpcServer, deployTx, platformKeypair);
+      if (typeof deployedAddress !== "string") {
+        throw new Error(
+          `expected the deploy transaction's return value to be the new contract's address, got: ${JSON.stringify(deployedAddress)}`,
+        );
+      }
+      const throwawayContractId = deployedAddress;
+      console.log(`✅ Throwaway contract deployed at ${throwawayContractId}`);
+
+      console.log(`Simulating version() against the candidate wasm's own instance...`);
+      const throwawayContract = new Contract(throwawayContractId);
+      const invokerAccount = await rpcServer.getAccount(platformKeypair.publicKey());
+      const invokeTx = new TransactionBuilder(invokerAccount, {
         fee: "1000",
         networkPassphrase,
       })
-        .addOperation(contract.call("version"))
-        .setTimeout(30)
+        .addOperation(throwawayContract.call("version"))
+        .setTimeout(TX_TIMEOUT_SECONDS)
         .build();
 
-      let sim = await rpcServer.simulateTransaction(tx);
-      if (SorobanRpc.Api.isSimulationError(sim)) {
-        throw new Error(`Simulation failed: ${sim.error}`);
+      const sim = await rpcServer.simulateTransaction(invokeTx);
+      if (rpc.Api.isSimulationError(sim)) {
+        throw new Error(`Simulation of the candidate wasm failed: ${sim.error}`);
       }
-      console.log(`✅ version() entrypoint simulated successfully`);
+      console.log(`✅ version() simulated successfully against the candidate wasm`);
 
-      // 2. We can simulate a get_account call for a mock importer
-      // If we don't know an importer, we can just log success for the dry-run of version
-      
-      console.log(`\n✅ Dry-run completed successfully! No deserialization panics detected.`);
+      console.log(
+        `\n✅ Dry-run completed successfully! The candidate wasm was uploaded, deployed as a ` +
+          `throwaway instance, and invoked without a deserialization panic. This does not fully ` +
+          `prove storage compatibility with the LIVE contract's existing stored data (the throwaway ` +
+          `instance starts with empty storage) — only that the wasm itself loads and its entrypoints ` +
+          `execute. Review the actual propose_upgrade + approve_upgrade flow on testnet against real ` +
+          `data before a mainnet upgrade.`,
+      );
       process.exit(0);
     } catch (e) {
       console.error("❌ Dry-run failed:", e);

@@ -22,6 +22,35 @@
     - notify: [sms, call]
       delay: 300
 
+# API Readiness Monitor
+# Tracks /health/ready independently of /health so that a deployment gate
+# failure (service not ready to accept traffic) is surfaced without waiting for
+# the comprehensive /health check to fire. Uses a lighter escalation policy
+# (no phone calls) because a failing readiness probe often indicates an
+# intentional out-of-rotation state or a slow cold start, not a hard outage.
+- name: TariffShield API Readiness
+  url: https://api.tariffshield.com/health/ready
+  monitor_type: status
+  check_interval: 60
+  assertions:
+    - type: status_code
+      value: "200"
+  alert_contacts:
+    - email: on-call@tariffshield.com
+  recovery_period: 0
+  confirmation_period: 0
+  call: false
+  sms: true
+  email: true
+  push: true
+  # Lighter escalation: email immediately, SMS after 5 min sustained failure.
+  # No phone calls — readiness failures may be intentional (deploys, scale-down).
+  escalation_policy:
+    - notify: [email]
+      delay: 0
+    - notify: [sms]
+      delay: 300
+
 # Web App Monitor
 - name: TariffShield Web App
   url: https://app.tariffshield.com/
