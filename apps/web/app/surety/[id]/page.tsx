@@ -31,7 +31,7 @@ export default function SuretyImporterDetail() {
       // #255: events are no longer inlined into getImporter() — fetch the
       // first page from the cursor-paginated endpoint instead.
       const page = await api.getImporterEventsCursor(params.id);
-      setEvents(page.events);
+      setEvents(page.data);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     }

@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { pool, logAudit } from "../db.js";
+import { pool, logAudit, getStaleAccounts } from "../db.js";
 import { authMiddleware, requireRole, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
 import { platformKeypair, oracleKeypair, contractClient } from "../stellar.js";
 import { bustHtsCache } from "../services/hts-rate-validator.js";

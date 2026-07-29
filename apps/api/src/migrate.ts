@@ -12,7 +12,19 @@ stub("TARIFF_SHIELD_CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 stub("PLATFORM_STELLAR_SECRET", "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB");
 stub("SURETY_STELLAR_SECRET", "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC");
 
-const { migrate, pool } = await import("./db.js");
-await migrate();
-await pool.end();
-console.log("Migrations complete.");
+const { migrate, rollback, pool } = await import("./db.js");
+
+const action = process.argv[2] === "rollback" ? "rollback" : "up";
+
+try {
+  if (action === "rollback") {
+    await rollback();
+  } else {
+    await migrate();
+  }
+} catch (err) {
+  console.error("Migration command failed:", err);
+  process.exit(1);
+} finally {
+  await pool.end();
+}

@@ -26,6 +26,48 @@ The API exports three health check endpoints:
 - `/health/ready`: Readiness probe for deployment gates (Kubernetes/Render).
 - `/health/live`: Liveness probe (process heart-beat).
 
+## Prometheus Alert Routing
+
+### Alertmanager configuration
+
+Alertmanager configuration lives **outside this repository** in the infrastructure
+deployment repo. It consumes the rules from `monitoring/prometheus/alerts/` and routes
+them to notification channels based on label values. Contact the infrastructure team
+or check the internal Terraform/Helm configs for the active Alertmanager config file.
+
+### Label conventions
+
+All alert rules must carry the following labels so Alertmanager can route them
+to the correct receiver:
+
+| Label | Required values | Purpose |
+|---|---|---|
+| `severity` | `critical` or `warning` | Governs escalation urgency |
+| `team` | `backend` (all current alerts) | Routes to the team's Slack channel / on-call rotation |
+
+### Severity → notification channel mapping
+
+| Severity | Slack channel | PagerDuty escalation | Notes |
+|---|---|---|---|
+| `critical` | `#alerts-critical` | Yes — pages the on-call engineer immediately | Expect a response within 5 minutes |
+| `warning` | `#alerts-warning` | No — notification only | Investigate within the working day |
+
+### Alert inventory
+
+| Alert | File | Severity | Team | Runbook | Notification |
+|---|---|---|---|---|---|
+| `ContractEventIndexerHighLag` | `prometheus/alerts/indexer.yml` | critical | _(unset — see note)_ | [indexer-lag.md](runbooks/indexer-lag.md) | `#alerts-critical` + PagerDuty |
+| `ContractEventIndexerStalled` | `prometheus/alerts/indexer.yml` | critical | _(unset — see note)_ | [indexer-lag.md](runbooks/indexer-lag.md) | `#alerts-critical` + PagerDuty |
+| `ContractBalanceDriftDetected` | `prometheus/alerts/reconciliation.yml` | critical | backend | [balance-drift.md](runbooks/balance-drift.md) | `#alerts-critical` + PagerDuty |
+| `ReconciliationJobNotRunning` | `prometheus/alerts/reconciliation.yml` | critical | backend | [balance-drift.md](runbooks/balance-drift.md) | `#alerts-critical` + PagerDuty |
+| `DbSlowQueryRateHigh` | `prometheus/alerts/database.yml` | warning | backend | _(none)_ | `#alerts-warning` only |
+| `DbCriticalSlowQuery` | `prometheus/alerts/database.yml` | critical | backend | _(none)_ | `#alerts-critical` + PagerDuty |
+
+> **Gap:** `ContractEventIndexerHighLag` and `ContractEventIndexerStalled` are missing
+> the `team: backend` label. Until that label is added, Alertmanager cannot route them
+> to the backend team's receiver — they will fall through to the default receiver (if any).
+> See issue #763 / #762.
+
 ## Metrics & Dashboards
 
 - **Prometheus:** Scrapes metrics from `/metrics` on the API.
@@ -103,6 +145,9 @@ The `traceId` and `spanId` are automatically injected into Pino log records via 
 |---|---|---|---|
 | `db_query_duration_seconds` | Histogram | `query_name` | Query latency distribution |
 | `db_slow_queries_total` | Counter | `threshold` (`500ms` / `2000ms`) | Count of slow queries |
+| `pg_pool_active` | Gauge | — | PostgreSQL pool clients currently checked out |
+| `pg_pool_idle` | Gauge | — | Idle PostgreSQL pool clients available for reuse |
+| `pg_pool_waiting` | Gauge | — | Queued requests waiting for a PostgreSQL pool client |
 
 ### Slow query log fields
 
@@ -118,8 +163,9 @@ Queries taking ≥2000ms emit a Pino `error`.
 
 `monitoring/prometheus/alerts/database.yml` defines:
 
-- **DbSlowQueryRateHigh** — fires when the 500ms slow query rate > 1/s for 3 minutes (warning)
-- **DbCriticalSlowQuery** — fires immediately on any ≥2s query (critical)
+- **DbSlowQueryRateHigh** — fires when the 500ms slow query rate > 1/s for 3 minutes (warning). See monitoring/runbooks/database-slow-queries.md.
+- **DbCriticalSlowQuery** — fires immediately on any ≥2s query (critical). See monitoring/runbooks/database-slow-queries.md.
+- **PgPoolExhaustion** (issue #760) — fires when more than 5 requests have waited for a pool client for over 10 seconds (warning). Mirrors the in-process log-only check already in `apps/api/src/db.ts`. See monitoring/runbooks/pg-pool-exhaustion.md.
 
 ### Top 10 slowest queries via pg_stat_statements
 
@@ -148,3 +194,30 @@ To reset the statistics:
 ```sql
 SELECT pg_stat_statements_reset();
 ```
+
+## Importer Metrics Refresh (issue #761)
+
+`monitoring/prometheus/alerts/importer-metrics.yml` defines:
+
+- **ImporterMetricsRefreshJobNotRunning** — fires when no `importer_metrics_mv` refresh attempts have run in 15 minutes (critical)
+- **ImporterMetricsRefreshJobFailing** — fires when refresh attempts have been failing for 10 minutes (warning)
+
+See `monitoring/runbooks/importer-metrics-refresh.md` for the response procedure.
+
+---
+
+## HTTP Request Metrics (issue #758, #759)
+
+### Prometheus metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `http_requests_total` | Counter | `method`, `route`, `status_code` | Total HTTP requests processed |
+| `http_request_duration_seconds` | Histogram | `method`, `route`, `status_code` | HTTP request latency distribution |
+
+### Alert rules
+
+`monitoring/prometheus/alerts/http.yml` defines:
+
+- **HttpServerErrorRateHigh** — fires when the HTTP 5xx rate exceeds 0.05/s for 5 minutes (warning). See monitoring/runbooks/http-errors.md.
+- **HttpRequestLatencyHighP95** — fires when p95 request latency exceeds 1s for 5 minutes (warning). See monitoring/runbooks/http-latency.md.

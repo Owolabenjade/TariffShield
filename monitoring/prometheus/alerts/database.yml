@@ -16,6 +16,7 @@ groups:
               SELECT query, total_exec_time, calls
               FROM pg_stat_statements
               ORDER BY total_exec_time DESC LIMIT 10;
+          runbook_url: "https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/database-slow-queries.md"
 
       - alert: DbCriticalSlowQuery
         expr: increase(db_slow_queries_total{threshold="2000ms"}[5m]) > 0
@@ -30,3 +31,26 @@ groups:
             Investigate immediately — check the API structured logs for
             { "level": "error", "caller": "<query_name>" } entries and review
             EXPLAIN ANALYZE output for the offending query.
+          runbook_url: "https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/database-slow-queries.md"
+
+      # Mirrors the in-process check in apps/api/src/db.ts (WAITING_ALERT_THRESHOLD=5,
+      # WAITING_ALERT_DURATION_MS=10s), which only logs a pino error and is not
+      # wired into Alertmanager. Keep these two thresholds in sync if either
+      # changes — they are intentionally checking the same condition through
+      # two different paths (fast in-process log vs. Alertmanager paging) and
+      # must not silently diverge.
+      - alert: PgPoolExhaustion
+        expr: pg_pool_waiting > 5
+        for: 10s
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "PostgreSQL pool exhaustion ({{ $value }} requests waiting)"
+          description: >
+            More than 5 requests have been waiting for a PostgreSQL pool client
+            for over 10 seconds on instance {{ $labels.instance }}. Check
+            pg_pool_active/pg_pool_idle to see how saturated the pool is, and
+            whether PG_POOL_MAX needs to be raised or a slow query is holding
+            connections open.
+          runbook_url: "https://github.com/TariffShield/TariffShield/blob/main/monitoring/runbooks/pg-pool-exhaustion.md"
