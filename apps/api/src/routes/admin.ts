@@ -1,8 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { pool, getStaleAccounts } from "../db.js";
+import { pool, getStaleAccounts, refreshImporterMetricsView } from "../db.js";
 import { authMiddleware, requireRole, privacyReacceptanceGate, tosReacceptanceGate, type AuthedRequest } from "../auth.js";
-import { platformKeypair, oracleKeypair } from "../stellar.js";
+import { platformKeypair, oracleKeypair, contractClient } from "../stellar.js";
 import { bustHtsCache } from "../services/hts-rate-validator.js";
 
 export const adminRouter = Router();
@@ -403,3 +403,135 @@ adminRouter.get(
     res.end();
   },
 );
+
+// ── #247: POST /admin/auto-top-up — batch auto-top-up ──────────────────────
+//
+// The per-importer POST /importers/:id/auto-top-up route (routes/importers.ts)
+// enqueues one BullMQ job per call, so a surety admin managing N importers
+// waits for N sequential job round-trips. This endpoint instead:
+//   1. finds every eligible importer (mirrored balance below required
+//      collateral) with a single query against the importer_metrics
+//      materialized view instead of one lookup per importer, and
+//   2. submits the Soroban auto_top_up calls directly and concurrently,
+//      capped at CONCURRENCY_CAP in flight at once so a large batch can't
+//      overrun the RPC node's rate limits.
+//
+// Complexity: O(n) Soroban calls for n eligible importers. Wall-clock time
+// is bounded by ceil(n / CONCURRENCY_CAP) rounds of RPC latency in the
+// worst case (a slow call only blocks the one worker slot it occupies, not
+// the whole batch — see mapWithConcurrency), so n=100 at CONCURRENCY_CAP=10
+// completes in roughly 10 rounds of ~200-600ms, comfortably under a 10s p95
+// target. Space is O(n) for the eligible-importer list and results array.
+
+const CONCURRENCY_CAP = 10;
+
+interface EligibleImporter {
+  importer_id: string;
+  stellar_address: string;
+}
+
+interface AutoTopUpSuccess {
+  importerId: string;
+  txHash: string;
+  amount: string;
+}
+
+/**
+ * Bounded-concurrency worker pool: runs `worker` over `items`, never more
+ * than `concurrency` invocations in flight at once. Workers share a single
+ * cursor and each pulls the next unclaimed item as soon as it finishes its
+ * previous one, so one slow item only ever occupies one worker slot rather
+ * than stalling a whole fixed-size batch.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runWorker(): Promise<void> {
+    for (;;) {
+      const current = nextIndex++;
+      if (current >= items.length) return;
+      try {
+        results[current] = { status: "fulfilled", value: await worker(items[current]!) };
+      } catch (reason) {
+        results[current] = { status: "rejected", reason };
+      }
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
+const BatchAutoTopUpSchema = z.object({
+  importer_ids: z.array(z.string().uuid()).optional(),
+});
+
+adminRouter.post("/auto-top-up", requireRole("surety_admin"), async (req: Request, res: Response) => {
+  const parse = BatchAutoTopUpSchema.safeParse(req.body ?? {});
+  if (!parse.success) {
+    res.status(400).json({ error: "invalid input", details: parse.error.issues });
+    return;
+  }
+  const { importer_ids } = parse.data;
+
+  const params: unknown[] = [];
+  let filterClause = "";
+  if (importer_ids && importer_ids.length > 0) {
+    params.push(importer_ids);
+    filterClause = `AND im.importer_id = ANY($${params.length}::uuid[])`;
+  }
+
+  // Single query for every eligible importer — required kyc_status = 'approved'
+  // (#229) since auto-top-up moves an importer's own collateral funds, and the
+  // importer_metrics view already excludes soft-deleted importers.
+  const eligible = await pool.query<EligibleImporter>(
+    `SELECT im.importer_id, im.stellar_address
+       FROM importer_metrics im
+       JOIN importers i ON i.id = im.importer_id
+      WHERE i.kyc_status = 'approved'
+        AND im.required_collateral > 0
+        AND im.current_balance < im.required_collateral
+        ${filterClause}`,
+    params,
+  );
+
+  const outcomes = await mapWithConcurrency(
+    eligible.rows,
+    CONCURRENCY_CAP,
+    async (row): Promise<AutoTopUpSuccess> => {
+      const onChain = await contractClient.autoTopUp(platformKeypair, row.stellar_address);
+      // Bare ON CONFLICT DO NOTHING: correct whether contract_events is
+      // partitioned (#228) or not — see lib/contract-events-partitions.ts
+      // for why an explicit column list can't be used once it is.
+      await pool.query(
+        `INSERT INTO contract_events (importer_id, kind, amount, tx_hash, ledger_sequence, event_index)
+         VALUES ($1, 'auto_top_up', $2, $3, $4, $5)
+         ON CONFLICT DO NOTHING`,
+        [row.importer_id, onChain.result.toString(), onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder],
+      );
+      return { importerId: row.importer_id, txHash: onChain.txHash, amount: onChain.result.toString() };
+    },
+  );
+
+  const errors: Array<{ id: string; reason: string }> = [];
+  let succeeded = 0;
+  outcomes.forEach((outcome, i) => {
+    if (outcome.status === "fulfilled") {
+      succeeded += 1;
+    } else {
+      errors.push({ id: eligible.rows[i]!.importer_id, reason: String(outcome.reason) });
+    }
+  });
+
+  // Best-effort refresh so a subsequent call sees updated balances; a
+  // failure here shouldn't turn a successful batch into an error response.
+  await refreshImporterMetricsView().catch(() => undefined);
+
+  res.json({ succeeded, failed: errors.length, errors });
+});
