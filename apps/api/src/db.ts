@@ -249,6 +249,25 @@ export async function rollback(): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
+    -- #228: this CREATE TABLE IF NOT EXISTS is only the pre-partition
+    -- fallback shape, used by rollback()'s baseline-ensure safety net (it
+    -- runs after a full migration rollback, so it must work against an
+    -- empty database). It never runs against a database where 0002 has
+    -- already partitioned contract_events, because IF NOT EXISTS makes it
+    -- a no-op once the table exists in either form.
+    --
+    -- The authoritative, currently-applied shape is defined in
+    -- migrations/0002_partition_contract_events.ts: contract_events is
+    -- PARTITION BY RANGE (created_at) with one child table per calendar
+    -- month (contract_events_YYYY_MM, plus a DEFAULT partition as a safety
+    -- net), PRIMARY KEY (id, created_at) — Postgres requires the partition
+    -- key in any PK/unique constraint declared on a partitioned table —
+    -- and monthly partitions are kept pre-created by
+    -- jobs/ensure-contract-events-partitions.ts. See that migration and
+    -- lib/contract-events-partitions.ts for the full rationale, including
+    -- why the ledger_sequence/event_index uniqueness guard below has to be
+    -- a local per-partition index rather than a single index on the
+    -- parent.
     CREATE TABLE IF NOT EXISTS contract_events (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
       importer_id UUID REFERENCES importers(id) ON DELETE CASCADE,
@@ -274,14 +293,19 @@ export async function rollback(): Promise<void> {
     -- resulting in a footprint that is orders of magnitude smaller (typically ~1:800 or 99.8% smaller).
     -- pages_per_range is set to 32 (down from default 128) to provide finer search granularity,
     -- which is highly effective for chronologically ordered event logs under high-volume ingestion.
-    -- If contract_events is partitioned by month (Issue #228), parent indexes automatically propagate
-    -- to all child partitions.
+    -- #228: this and the two importer-scoped indexes above are declared the
+    -- same way on the authoritative partitioned table (migrations/0002_
+    -- partition_contract_events.ts) — indexes created on a partitioned
+    -- parent automatically propagate to every current and future partition.
     CREATE INDEX IF NOT EXISTS idx_contract_events_created_at_brin ON contract_events USING BRIN (created_at) WITH (pages_per_range = 32);
 
 
     ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS ledger_sequence INTEGER;
     ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_index INTEGER;
 
+    -- #228: on the partitioned table this same uniqueness guard is instead a
+    -- LOCAL index created individually per partition, not a single index on
+    -- the parent — see lib/contract-events-partitions.ts for why.
     CREATE UNIQUE INDEX IF NOT EXISTS idx_contract_events_ledger_event
       ON contract_events(ledger_sequence, event_index)
       WHERE ledger_sequence IS NOT NULL AND event_index IS NOT NULL;

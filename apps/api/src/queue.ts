@@ -138,10 +138,13 @@ export function createTxSubmitWorker() {
           break;
       }
 
+      // #228: bare ON CONFLICT DO NOTHING (no explicit column list) — required
+      // now that contract_events is partitioned; see the doc comment on
+      // createContractEventsPartition() in lib/contract-events-partitions.ts.
       await pool.query(
         `INSERT INTO contract_events (importer_id, kind, amount, tx_hash, ledger_sequence, event_index)
          VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (ledger_sequence, event_index) DO NOTHING`,
+         ON CONFLICT DO NOTHING`,
         [importerId, eventKind, eventAmount, onChain.txHash, onChain.ledgerSequence, onChain.applicationOrder],
       );
 
