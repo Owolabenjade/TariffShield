@@ -3474,3 +3474,71 @@ importersRouter.delete('/:id/documents/:docId', async (req: Request, res: Respon
 
   res.json({ success: true });
 });
+
+// ── #1019: Historical Tariff Rate Trend Endpoints ────────────────────────────
+
+const TariffHistoryQuerySchema = z.object({
+  htsCode: z.string().min(4).max(14),
+  startDate: z.string().optional(),
+  endDate: z.string().optional(),
+});
+
+// GET /importers/:id/tariff-history — read-only historical duty rate trend for HTS code
+importersRouter.get('/:id/tariff-history', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const parse = TariffHistoryQuerySchema.safeParse(req.query);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid query parameters', details: parse.error.issues });
+    return;
+  }
+  const { htsCode, startDate, endDate } = parse.data;
+
+  try {
+    // Get importer's latest CSV upload timestamp
+    const latestUploadRes = await pool.query(
+      `SELECT created_at FROM importer_tariff_uploads WHERE importer_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [importer.id]
+    );
+    const latestUploadDate = latestUploadRes.rows[0]?.created_at || null;
+
+    // Build query for hts_rate_history
+    const conditions: string[] = ['hts_code = $1'];
+    const params: any[] = [htsCode];
+
+    if (startDate) {
+      params.push(startDate);
+      conditions.push(`effective_date >= $${params.length}`);
+    }
+    if (endDate) {
+      params.push(endDate);
+      conditions.push(`effective_date <= $${params.length}`);
+    }
+
+    const historyRes = await pool.query(
+      `SELECT hts_code, duty_rate::float AS duty_rate, effective_date, source, created_at
+       FROM hts_rate_history
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY effective_date ASC`,
+      params
+    );
+
+    res.json({
+      htsCode,
+      latestUploadDate,
+      history: historyRes.rows.map((r) => ({
+        date: r.effective_date,
+        dutyRate: r.duty_rate,
+        source: r.source,
+      })),
+    });
+  } catch (err: any) {
+    console.error('[importers] failed to query tariff rate history:', err);
+    res.status(500).json({ error: 'failed to retrieve tariff history' });
+  }
+});
+
