@@ -986,3 +986,183 @@ adminRouter.post(
     res.json({ dispute: updated.rows[0], txUrl: explorerTx(onChain.txHash) });
   }
 );
+
+// ── #1018: Oracle Signer Rotation Workflow Endpoints ─────────────────────────
+
+const ProposeRotationSchema = z.object({
+  newSigners: z.array(z.string().length(56)).length(3),
+});
+
+// POST /admin/oracle-signers/propose — propose a new set of 3 oracle signers
+adminRouter.post('/oracle-signers/propose', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const parse = ProposeRotationSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+  const { newSigners } = parse.data;
+
+  // Enforce distinct signers
+  if (new Set(newSigners).size !== 3) {
+    res.status(400).json({ error: 'new signers must be 3 distinct Stellar addresses' });
+    return;
+  }
+
+  try {
+    const inserted = await pool.query(
+      `INSERT INTO oracle_signer_rotations (proposed_by, new_signers, threshold, status)
+       VALUES ($1, $2, 2, 'pending_signatures')
+       RETURNING id, proposed_by, new_signers, threshold, approvals, status, created_at`,
+      [user.id, JSON.stringify(newSigners)]
+    );
+
+    await logAudit(user.id, 'oracle_signer_rotation_proposed', inserted.rows[0].id, { newSigners });
+
+    res.status(201).json({ proposal: inserted.rows[0] });
+  } catch (err: any) {
+    console.error('[admin] failed to propose oracle signer rotation:', err);
+    res.status(500).json({ error: 'failed to create signer rotation proposal' });
+  }
+});
+
+// GET /admin/oracle-signers/active — get active proposal and on-chain signers
+adminRouter.get('/oracle-signers/active', requireRole('surety_admin'), async (_req: Request, res: Response) => {
+  try {
+    const proposalRes = await pool.query(
+      `SELECT id, proposed_by, new_signers, threshold, approvals, status, created_at
+       FROM oracle_signer_rotations
+       WHERE status = 'pending_signatures'
+       ORDER BY created_at DESC LIMIT 1`
+    );
+
+    let onChainSigners: string[] = [];
+    try {
+      onChainSigners = await contractClient.getOracleSigners();
+    } catch {
+      // Fallback if contract client mock/network is unavailable
+      onChainSigners = [];
+    }
+
+    res.json({
+      activeProposal: proposalRes.rows[0] ?? null,
+      onChainSigners,
+    });
+  } catch (err: any) {
+    console.error('[admin] failed to fetch active oracle signer rotation:', err);
+    res.status(500).json({ error: 'failed to fetch active rotation proposal' });
+  }
+});
+
+// POST /admin/oracle-signers/:id/approve — add approval to proposal
+adminRouter.post('/oracle-signers/:id/approve', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const proposalId = req.params.id;
+
+  try {
+    const proposalRes = await pool.query(
+      `SELECT id, approvals, threshold, status FROM oracle_signer_rotations WHERE id = $1 AND status = 'pending_signatures'`,
+      [proposalId]
+    );
+
+    if (!proposalRes.rowCount) {
+      res.status(404).json({ error: 'active proposal not found' });
+      return;
+    }
+
+    const proposal = proposalRes.rows[0];
+    const approvals: Array<{ approverId: string; approvedAt: string }> = proposal.approvals || [];
+
+    if (approvals.some((a) => a.approverId === user.id)) {
+      res.status(409).json({ error: 'you have already approved this proposal' });
+      return;
+    }
+
+    approvals.push({ approverId: user.id, approvedAt: new Date().toISOString() });
+
+    const updated = await pool.query(
+      `UPDATE oracle_signer_rotations SET approvals = $1 WHERE id = $2 RETURNING id, new_signers, threshold, approvals, status`,
+      [JSON.stringify(approvals), proposalId]
+    );
+
+    await logAudit(user.id, 'oracle_signer_rotation_approved', proposalId, { approvalCount: approvals.length });
+
+    res.json({ proposal: updated.rows[0] });
+  } catch (err: any) {
+    console.error('[admin] failed to approve oracle signer rotation:', err);
+    res.status(500).json({ error: 'failed to submit approval' });
+  }
+});
+
+// POST /admin/oracle-signers/:id/execute — execute signer rotation on-chain
+adminRouter.post('/oracle-signers/:id/execute', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const proposalId = req.params.id;
+
+  try {
+    const proposalRes = await pool.query(
+      `SELECT id, new_signers, threshold, approvals, status FROM oracle_signer_rotations WHERE id = $1 AND status = 'pending_signatures'`,
+      [proposalId]
+    );
+
+    if (!proposalRes.rowCount) {
+      res.status(404).json({ error: 'active proposal not found' });
+      return;
+    }
+
+    const proposal = proposalRes.rows[0];
+    const approvals = proposal.approvals || [];
+
+    if (approvals.length < proposal.threshold) {
+      res.status(400).json({ error: `insufficient approvals: need ${proposal.threshold}, got ${approvals.length}` });
+      return;
+    }
+
+    const newSigners: string[] = typeof proposal.new_signers === 'string' ? JSON.parse(proposal.new_signers) : proposal.new_signers;
+
+    const onChain = await contractClient.updateOracleSigners(
+      platformKeypair,
+      newSigners,
+      [platformKeypair.publicKey(), oracleKeypair.publicKey()]
+    );
+
+    const updated = await pool.query(
+      `UPDATE oracle_signer_rotations
+       SET status = 'executed', tx_hash = $1, executed_at = NOW()
+       WHERE id = $2
+       RETURNING id, new_signers, status, tx_hash, executed_at`,
+      [onChain.txHash, proposalId]
+    );
+
+    await logAudit(user.id, 'oracle_signer_rotation_executed', proposalId, {
+      txHash: onChain.txHash,
+      newSigners,
+    });
+
+    res.json({
+      proposal: updated.rows[0],
+      txUrl: explorerTx(onChain.txHash),
+    });
+  } catch (err: any) {
+    console.error('[admin] failed to execute oracle signer rotation:', err);
+    res.status(500).json({ error: 'failed to execute signer rotation on-chain' });
+  }
+});
+
+// GET /admin/oracle-signers/history — rotation audit history
+adminRouter.get('/oracle-signers/history', requireRole('surety_admin'), async (_req: Request, res: Response) => {
+  try {
+    const historyRes = await pool.query(
+      `SELECT r.id, r.proposed_by, u.email AS proposed_by_email, r.new_signers, r.threshold, r.approvals, r.status, r.tx_hash, r.created_at, r.executed_at
+       FROM oracle_signer_rotations r
+       LEFT JOIN users u ON u.id = r.proposed_by
+       ORDER BY r.created_at DESC LIMIT 50`
+    );
+
+    res.json({ history: historyRes.rows });
+  } catch (err: any) {
+    console.error('[admin] failed to fetch oracle signer rotation history:', err);
+    res.status(500).json({ error: 'failed to fetch rotation history' });
+  }
+});
+
