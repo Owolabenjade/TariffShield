@@ -214,13 +214,17 @@ importersRouter.get('/', async (req: Request, res: Response) => {
     );
   } else {
     r = await pool.query(
-      `SELECT i.id, i.legal_name, i.bond_id, i.stellar_address, i.created_at
-         FROM importers i WHERE i.user_id = $1`,
+      `SELECT DISTINCT i.id, i.legal_name, i.bond_id, i.stellar_address, i.created_at
+         FROM importers i
+         LEFT JOIN importer_team_members tm ON tm.importer_id = i.id AND tm.user_id = $1 AND tm.status = 'active'
+         WHERE i.user_id = $1 OR tm.user_id IS NOT NULL
+         ORDER BY i.created_at DESC`,
       [user.id]
     );
   }
   res.json({ importers: r.rows });
 });
+
 
 // #251: surety-dashboard aggregate statistics, served from importer_metrics_mv
 // (a materialized view refreshed on a 5-minute schedule — see
@@ -734,12 +738,6 @@ async function loadImporterFor(req: Request, importerId: string) {
     const r = await pool.query('SELECT * FROM importers WHERE id = $1', [importerId]);
     return r.rows[0] ?? null;
   }
-  // #988 — a broker gets read-only access (GET only — loadImporterFor is
-  // shared by every importer-scoped route including destructive ones like
-  // deposit/withdraw/clawback/upload-tariff-csv, and "Broker access excludes
-  // destructive admin-only actions" is an explicit AC) for any importer they
-  // hold an active (non-revoked) grant for; no grant means no access, same
-  // as any other user_id mismatch below.
   if (user.role === 'broker') {
     if (req.method !== 'GET') return null;
     const granted = await hasActiveBrokerGrant(user.id, importerId);
@@ -747,12 +745,156 @@ async function loadImporterFor(req: Request, importerId: string) {
     const r = await pool.query('SELECT * FROM importers WHERE id = $1', [importerId]);
     return r.rows[0] ?? null;
   }
-  const r = await pool.query('SELECT * FROM importers WHERE id = $1 AND user_id = $2', [
-    importerId,
-    user.id,
-  ]);
-  return r.rows[0] ?? null;
+
+  // Check direct ownership or active team membership (#1015)
+  const r = await pool.query(
+    `SELECT i.*, 
+            CASE 
+              WHEN i.user_id = $2 THEN 'owner'
+              ELSE tm.role::text
+            END as member_role
+     FROM importers i
+     LEFT JOIN importer_team_members tm 
+       ON tm.importer_id = i.id AND tm.user_id = $2 AND tm.status = 'active'
+     WHERE i.id = $1 AND (i.user_id = $2 OR tm.user_id IS NOT NULL)`,
+    [importerId, user.id]
+  );
+  const importer = r.rows[0];
+  if (!importer) return null;
+
+  // Enforce role-based permission boundaries:
+  // Viewer role is read-only (GET requests only)
+  if (importer.member_role === 'viewer' && req.method !== 'GET') {
+    return null;
+  }
+
+  return importer;
 }
+
+// ── #1015: Importer Team Member Management Endpoints ─────────────────────────
+
+const InviteTeamMemberSchema = z.object({
+  email: z.string().email().toLowerCase(),
+  role: z.enum(['admin', 'finance', 'viewer']).default('viewer'),
+});
+
+// GET /importers/:id/members — list team members for importer
+importersRouter.get('/:id/members', async (req: Request, res: Response) => {
+  const importerId = String(req.params.id ?? '');
+  const importer = await loadImporterFor(req, importerId);
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const result = await pool.query(
+    `SELECT tm.id, tm.email, tm.role, tm.status, tm.invited_at, tm.accepted_at, tm.revoked_at,
+            u.id AS user_id
+     FROM importer_team_members tm
+     LEFT JOIN users u ON u.id = tm.user_id
+     WHERE tm.importer_id = $1
+     ORDER BY tm.invited_at DESC`,
+    [importerId]
+  );
+
+  res.json({ members: result.rows });
+});
+
+// POST /importers/:id/members/invite — invite team member
+importersRouter.post('/:id/members/invite', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importerId = String(req.params.id ?? '');
+  const importer = await loadImporterFor(req, importerId);
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  // Only owner or team members with role 'owner' / 'admin' can invite
+  if (importer.user_id !== user.id && importer.member_role !== 'admin') {
+    res.status(403).json({ error: 'only owner or importer admin can invite team members' });
+    return;
+  }
+
+  const parse = InviteTeamMemberSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+  const { email, role } = parse.data;
+
+  const rawToken = createHash('sha256').update(randomBytes(32)).digest('hex');
+  const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+
+  try {
+    const inserted = await pool.query(
+      `INSERT INTO importer_team_members (importer_id, email, role, status, invite_token_hash, invited_by)
+       VALUES ($1, $2, $3, 'pending', $4, $5)
+       ON CONFLICT (importer_id, email) DO UPDATE
+         SET role = EXCLUDED.role,
+             status = 'pending',
+             invite_token_hash = EXCLUDED.invite_token_hash,
+             invited_by = EXCLUDED.invited_by,
+             invited_at = NOW(),
+             revoked_at = NULL
+       RETURNING id, importer_id, email, role, status, invited_at`,
+      [importerId, email, role, tokenHash, user.id]
+    );
+
+    await logAudit(user.id, 'team_member_invited', importerId, { email, role });
+
+    res.status(201).json({
+      invite: {
+        ...inserted.rows[0],
+        token: rawToken,
+      },
+    });
+  } catch (err: any) {
+    console.error('[importers] failed to invite team member:', err);
+    res.status(500).json({ error: 'failed to invite team member' });
+  }
+});
+
+// DELETE /importers/:id/members/:memberId — revoke team member access
+importersRouter.delete('/:id/members/:memberId', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importerId = String(req.params.id ?? '');
+  const memberId = String(req.params.memberId ?? '');
+
+  const importer = await loadImporterFor(req, importerId);
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  if (importer.user_id !== user.id && importer.member_role !== 'admin') {
+    res.status(403).json({ error: 'only owner or importer admin can revoke team members' });
+    return;
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE importer_team_members
+       SET status = 'revoked', revoked_at = NOW()
+       WHERE id = $1 AND importer_id = $2
+       RETURNING id, email, status, revoked_at`,
+      [memberId, importerId]
+    );
+
+    if (!result.rowCount) {
+      res.status(404).json({ error: 'team member not found' });
+      return;
+    }
+
+    await logAudit(user.id, 'team_member_revoked', importerId, { memberId });
+
+    res.json({ member: result.rows[0] });
+  } catch (err: any) {
+    console.error('[importers] failed to revoke team member:', err);
+    res.status(500).json({ error: 'failed to revoke team member' });
+  }
+});
+
 
 /**
  * GET /admin/importers/metrics

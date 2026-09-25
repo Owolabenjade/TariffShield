@@ -481,3 +481,95 @@ authRouter.post('/saml/:provider/callback', async (req: Request, res: Response) 
     res.json({ token, user: { id: userId, email: userEmail, role: userRole } });
   }
 });
+
+// ── #1015: Accept Importer Team Member Invite ────────────────────────────────
+
+const AcceptTeamInviteSchema = z.object({
+  token: z.string().min(1),
+  password: z.string().min(8).optional(),
+});
+
+authRouter.post('/team-invite/accept', async (req: Request, res: Response) => {
+  const parse = AcceptTeamInviteSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+  const { token, password } = parse.data;
+
+  const tokenHash = createHash('sha256').update(token).digest('hex');
+
+  const inviteRes = await pool.query(
+    `SELECT tm.id, tm.importer_id, tm.email, tm.role, tm.status, tm.user_id
+     FROM importer_team_members tm
+     WHERE tm.invite_token_hash = $1 AND tm.status = 'pending'`,
+    [tokenHash]
+  );
+
+  if (!inviteRes.rowCount) {
+    res.status(404).json({ error: 'invalid or expired invite token' });
+    return;
+  }
+
+  const invite = inviteRes.rows[0];
+
+  try {
+    let userId = invite.user_id;
+
+    if (!userId) {
+      const existingUser = await pool.query('SELECT id, email, role FROM users WHERE email = $1', [invite.email]);
+      if (existingUser.rowCount) {
+        userId = existingUser.rows[0].id;
+      } else {
+        if (!password) {
+          res.status(400).json({ error: 'password required to create new team account' });
+          return;
+        }
+        const pwHash = await hashPassword(password);
+        const newUser = await pool.query(
+          `INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'importer') RETURNING id, email, role`,
+          [invite.email, pwHash]
+        );
+        userId = newUser.rows[0].id;
+      }
+    }
+
+    await pool.query(
+      `UPDATE importer_team_members
+       SET user_id = $1, status = 'active', accepted_at = NOW(), invite_token_hash = NULL
+       WHERE id = $2`,
+      [userId, invite.id]
+    );
+
+    const sessionId = await createSession(
+      userId,
+      req.ip ?? undefined,
+      req.get('user-agent') ?? undefined
+    );
+    const accessToken = signToken({
+      id: userId,
+      email: invite.email,
+      role: 'importer',
+      sessionId,
+      importerId: invite.importer_id,
+    });
+    const refreshToken = generateRefreshTokenPair(userId, req);
+    await refreshToken.tokenPromise;
+
+    res.json({
+      token: accessToken,
+      refreshToken: refreshToken.rawToken,
+      user: { id: userId, email: invite.email, role: 'importer' },
+      member: {
+        id: invite.id,
+        importerId: invite.importer_id,
+        role: invite.role,
+        status: 'active',
+      },
+    });
+  } catch (err: any) {
+    console.error('[auth] failed to accept team invite:', err);
+    res.status(500).json({ error: 'failed to accept team invite' });
+  }
+});
+
