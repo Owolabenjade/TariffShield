@@ -201,3 +201,83 @@ notificationsRouter.put('/preferences', async (req: Request, res: Response) => {
   const grid = await getPreferenceGrid(user.id);
   res.json({ preferences: grid });
 });
+
+// ── #1017: Configurable Health Score Alert Thresholds ────────────────────────
+
+const HealthThresholdsSchema = z
+  .object({
+    warningThreshold: z.number().int().min(1).max(100),
+    criticalThreshold: z.number().int().min(0).max(99),
+  })
+  .refine((data) => data.criticalThreshold < data.warningThreshold, {
+    message: 'criticalThreshold must be strictly less than warningThreshold',
+  });
+
+// GET /notifications/thresholds/:importerId — get importer health score thresholds
+notificationsRouter.get('/thresholds/:importerId', async (req: Request, res: Response) => {
+  const importerId = String(req.params.importerId ?? '');
+
+  const result = await pool.query(
+    'SELECT warning_threshold, critical_threshold, last_notified_state FROM importer_health_thresholds WHERE importer_id = $1',
+    [importerId]
+  );
+
+  if (result.rowCount === 0) {
+    res.json({
+      thresholds: {
+        warningThreshold: 60,
+        criticalThreshold: 40,
+        lastNotifiedState: 'NORMAL',
+      },
+    });
+    return;
+  }
+
+  const row = result.rows[0];
+  res.json({
+    thresholds: {
+      warningThreshold: row.warning_threshold,
+      criticalThreshold: row.critical_threshold,
+      lastNotifiedState: row.last_notified_state,
+    },
+  });
+});
+
+// PUT /notifications/thresholds/:importerId — configure importer health score thresholds
+notificationsRouter.put('/thresholds/:importerId', async (req: Request, res: Response) => {
+  const importerId = String(req.params.importerId ?? '');
+
+  const parse = HealthThresholdsSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid threshold configuration', details: parse.error.issues });
+    return;
+  }
+
+  const { warningThreshold, criticalThreshold } = parse.data;
+
+  try {
+    const upserted = await pool.query(
+      `INSERT INTO importer_health_thresholds (importer_id, warning_threshold, critical_threshold, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (importer_id) DO UPDATE
+         SET warning_threshold = EXCLUDED.warning_threshold,
+             critical_threshold = EXCLUDED.critical_threshold,
+             updated_at = NOW()
+       RETURNING warning_threshold, critical_threshold, last_notified_state`,
+      [importerId, warningThreshold, criticalThreshold]
+    );
+
+    const row = upserted.rows[0];
+    res.json({
+      thresholds: {
+        warningThreshold: row.warning_threshold,
+        criticalThreshold: row.critical_threshold,
+        lastNotifiedState: row.last_notified_state,
+      },
+    });
+  } catch (err: any) {
+    console.error('[notifications] failed to update health thresholds:', err);
+    res.status(500).json({ error: 'failed to update threshold settings' });
+  }
+});
+
