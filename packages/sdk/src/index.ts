@@ -395,10 +395,27 @@ export class TariffShieldClient {
     return scValToNative(raw) as string;
   }
 
+  async getOracleSigners(): Promise<string[]> {
+    const raw = await this.simulate('get_oracle_signers', []);
+    const scArray = scValToNative(raw) as string[];
+    return scArray;
+  }
+
+  async updateOracleSigners(
+    signer: Keypair,
+    newSigners: string[],
+    approvals: string[]
+  ): Promise<InvokeResult<void>> {
+    const scNewSigners = nativeToScVal(newSigners.map((s) => new Address(s)));
+    const scApprovals = nativeToScVal(approvals.map((s) => new Address(s)));
+    return this.invokeAndSubmit(signer, 'update_oracle_signers', [scNewSigners, scApprovals]);
+  }
+
   async version(): Promise<string> {
     const raw = await this.simulate('version', []);
     return scValToNative(raw) as string;
   }
+
 
   // ----- Internals -----
 
